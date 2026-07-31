@@ -14,7 +14,7 @@ use crate::model::{
     WindowInfo, parse_agent_kind, parse_agent_state, parse_hook_state, parse_status_source,
 };
 
-use super::commands::{q, split_fields, tmux_output};
+use super::commands::{q, run_tmux_quiet, split_fields, tmux_output};
 use super::options::*;
 
 /// Field order for [`pane_format`]. The consts and the format list must be
@@ -307,6 +307,69 @@ pub fn group_sessions(rows: &[PaneRow], agents_only: bool) -> Vec<SessionGroup> 
 /// Grouped sessions (`new-session -t`) share windows, so `list-panes -a` reports
 /// the same pane once per session. Displaying it under both sessions is correct
 /// for navigation, but the daemon must only reconcile and write it once.
+/// Read the user's session order: session names, lowest rank first.
+///
+/// Sessions with no rank sort after every ranked one, keeping their tmux order
+/// among themselves. That way a newly created session appears at the bottom rather
+/// than silently jumping into the middle of an order you arranged.
+pub fn session_order() -> Vec<String> {
+    let format = format!("#{{session_name}}\t#{{{SESSION_ORDER}}}");
+    let Ok(output) = tmux_output(&["list-sessions", "-F", &format]) else {
+        return Vec::new();
+    };
+    parse_session_order(&output)
+}
+
+fn parse_session_order(output: &str) -> Vec<String> {
+    let mut rows: Vec<(bool, usize, usize, String)> = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+        .map(|(tmux_index, line)| {
+            let (name, rank) = line.split_once('\t').unwrap_or((line, ""));
+            let rank = rank.trim().parse::<usize>().ok();
+            // The leading bool is the sort's first key: unranked last.
+            (
+                rank.is_none(),
+                rank.unwrap_or(0),
+                tmux_index,
+                name.to_owned(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows.into_iter().map(|(_, _, _, name)| name).collect()
+}
+
+/// Reorder `sessions` to match `order`, leaving anything unmentioned at the end.
+///
+/// Tolerant by design: the order list and the tree are read in separate tmux calls,
+/// so a session can appear in one and not the other. Names missing from `order` keep
+/// their relative position after the ordered ones.
+pub fn apply_session_order(sessions: &mut [SessionGroup], order: &[String]) {
+    sessions.sort_by_key(|session| {
+        order
+            .iter()
+            .position(|name| *name == session.session_name)
+            .unwrap_or(usize::MAX)
+    });
+}
+
+/// Persist the current order, so it outlives this process and every other sidebar
+/// picks it up.
+pub fn persist_session_order(sessions: &[SessionGroup]) {
+    for (rank, session) in sessions.iter().enumerate() {
+        run_tmux_quiet(&[
+            "set-option",
+            "-q",
+            "-t",
+            &session.session_name,
+            SESSION_ORDER,
+            &rank.to_string(),
+        ]);
+    }
+}
+
 pub fn unique_by_pane(rows: &[PaneRow]) -> Vec<&PaneRow> {
     let mut seen = std::collections::HashSet::new();
     rows.iter()
@@ -529,6 +592,66 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].windows.len(), 1, "@2 had no agent, so it is gone");
         assert_eq!(agents[0].windows[0].panes[0].pane_id, "%1");
+    }
+
+    // ─── session order ────────────────────────────────────────────────
+
+    fn group(name: &str) -> SessionGroup {
+        SessionGroup {
+            session_name: name.to_owned(),
+            session_attached: true,
+            windows: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ranked_sessions_sort_by_rank_not_by_tmux_order() {
+        let order = parse_session_order("alpha\t2\nbeta\t0\ngamma\t1\n");
+        assert_eq!(order, ["beta", "gamma", "alpha"]);
+    }
+
+    #[test]
+    fn unranked_sessions_go_last_keeping_their_tmux_order() {
+        // A session created after you arranged things should appear at the bottom,
+        // not silently insert itself into the middle of your order.
+        let order = parse_session_order("fresh\t\nalpha\t1\nalso_fresh\t\nbeta\t0\n");
+        assert_eq!(order, ["beta", "alpha", "fresh", "also_fresh"]);
+    }
+
+    #[test]
+    fn a_non_numeric_rank_counts_as_unranked() {
+        let order = parse_session_order("bad\tnonsense\ngood\t0\n");
+        assert_eq!(order, ["good", "bad"]);
+    }
+
+    #[test]
+    fn blank_and_malformed_lines_are_skipped() {
+        let order = parse_session_order("alpha\t0\n\n   \nnotabs\n");
+        assert_eq!(order, ["alpha", "notabs"]);
+    }
+
+    #[test]
+    fn applying_an_order_reorders_the_tree() {
+        let mut sessions = vec![group("a"), group("b"), group("c")];
+        apply_session_order(&mut sessions, &["c".to_owned(), "a".to_owned()]);
+        let names: Vec<&str> = sessions
+            .iter()
+            .map(|session| session.session_name.as_str())
+            .collect();
+        // "b" is not in the order, so it lands after everything that is.
+        assert_eq!(names, ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn applying_an_empty_or_unrelated_order_leaves_the_tree_alone() {
+        // The order and the tree come from two separate tmux calls, so they can
+        // legitimately disagree about which sessions exist.
+        let original = vec![group("a"), group("b")];
+        let mut sessions = original.clone();
+        apply_session_order(&mut sessions, &[]);
+        assert_eq!(sessions, original);
+        apply_session_order(&mut sessions, &["nothing".to_owned()]);
+        assert_eq!(sessions, original);
     }
 
     #[test]

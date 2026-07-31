@@ -10,4 +10,7 @@ pub use commands::{
     unset_global_option, unset_window_option,
 };
 pub use options::*;
-pub use query::{PaneRow, group_sessions, list_panes, unique_by_pane};
+pub use query::{
+    PaneRow, apply_session_order, group_sessions, list_panes, persist_session_order, session_order,
+    unique_by_pane,
+};

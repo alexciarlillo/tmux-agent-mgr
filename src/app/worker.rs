@@ -127,6 +127,10 @@ fn wait(wake: &AtomicBool, total: Duration) {
 fn collect(agents_only: bool, git: &mut GitCache) -> Option<Vec<SessionGroup>> {
     let rows = tmux::list_panes().ok()?;
     let mut sessions = tmux::group_sessions(&rows, agents_only);
+    // One extra subprocess per pass to honour the user's session order. tmux itself
+    // has no session ordering, so without this the list is alphabetical whatever the
+    // user arranged.
+    tmux::apply_session_order(&mut sessions, &tmux::session_order());
 
     let mut live_paths: Vec<&str> = Vec::new();
     for pane in sessions

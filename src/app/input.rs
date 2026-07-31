@@ -80,6 +80,16 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
         KeyCode::Char('k') | KeyCode::Up => app.move_counted(Direction::Up),
         KeyCode::Char('H') | KeyCode::Left => app.jump_session(Direction::Up),
         KeyCode::Char('L') | KeyCode::Right => app.jump_session(Direction::Down),
+        KeyCode::Char('K') | KeyCode::Char('J') => {
+            let direction = if key.code == KeyCode::Char('K') {
+                Direction::Up
+            } else {
+                Direction::Down
+            };
+            if app.move_session(direction) {
+                tmux::persist_session_order(&app.sessions);
+            }
+        }
         KeyCode::Char('g') | KeyCode::Home => {
             app.pending_count = None;
             app.selected = 0;

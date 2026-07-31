@@ -90,6 +90,13 @@ pub const PANE_TUI_PID: &str = "@agent_mgr_pid";
 pub const DAEMON_PID: &str = "@agent_mgr_daemon_pid";
 /// Per-window rolled-up status icon, interpolated into `window-status-format`.
 pub const WINDOW_ICON: &str = "@agent_mgr_window_icon";
+/// Per-session display rank, low first.
+///
+/// tmux has no notion of session order — `list-sessions` is alphabetical — so this
+/// is the sidebar's own ordering and affects nothing outside it. Stored on the
+/// session so it survives for the tmux server's lifetime and is shared by every
+/// sidebar and popup, rather than each instance keeping its own idea of the order.
+pub const SESSION_ORDER: &str = "@agent_mgr_session_order";
 
 // ─── 3. user configuration ───────────────────────────────────────────
 

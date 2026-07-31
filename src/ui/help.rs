@@ -42,6 +42,11 @@ pub const KEYMAP: &[Binding] = &[
         token: "jump_session",
     },
     Binding {
+        keys: "J K",
+        description: "move session down / up",
+        token: "move_session",
+    },
+    Binding {
         keys: "g G",
         description: "first / last pane",
         token: "KeyCode::Char('g')",

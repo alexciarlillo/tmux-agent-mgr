@@ -447,6 +447,40 @@ impl App {
         Some((state.window_id, name))
     }
 
+    /// `J` / `K`: move the selected pane's session up or down the list.
+    ///
+    /// Reorders our own display only — tmux has no session order of its own.
+    /// Applied to the unfiltered tree, since reordering under a filter would produce
+    /// an order that only makes sense while that filter is on.
+    ///
+    /// Returns whether anything moved. Pure, so the caller does the persisting: a
+    /// test pressing `J` must not write options onto the sessions of whichever tmux
+    /// server happens to be hosting the test run.
+    #[must_use]
+    fn move_session(&mut self, direction: Direction) -> bool {
+        self.pending_count = None;
+        let Some(block) = self.list.blocks.get(self.selected) else {
+            return false;
+        };
+        let name = block.target.session_name.clone();
+        let Some(from) = self
+            .sessions
+            .iter()
+            .position(|session| session.session_name == name)
+        else {
+            return false;
+        };
+        let to = match direction {
+            Direction::Up if from > 0 => from - 1,
+            Direction::Down if from + 1 < self.sessions.len() => from + 1,
+            // Already at the edge. Clamping silently is right here: there is no
+            // wrap-around reading of "move this session further up" that helps.
+            _ => return false,
+        };
+        self.sessions.swap(from, to);
+        true
+    }
+
     /// `H` / `L`: jump a whole session.
     fn jump_session(&mut self, direction: Direction) {
         // A count would have to mean "N sessions over", which nobody can aim; drop
@@ -955,6 +989,80 @@ mod tests {
         // The sidebar's whole value is that you keep jumping around with it open.
         assert!(Surface::Popup.dismisses_on_activate());
         assert!(!Surface::Sidebar.dismisses_on_activate());
+    }
+
+    // ─── session reorder ──────────────────────────────────────────────
+
+    fn multi_session_app(names: &[&str]) -> App {
+        let mut app = App::new(Surface::Sidebar, "%99".to_owned(), (40, 40));
+        app.sessions = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| SessionGroup {
+                session_name: (*name).to_owned(),
+                session_attached: true,
+                windows: vec![WindowInfo {
+                    window_id: format!("@{index}"),
+                    window_index: index.to_string(),
+                    window_name: "w".to_owned(),
+                    window_active: false,
+                    panes: vec![pane(&format!("%{index}"), AgentState::Idle, true)],
+                }],
+            })
+            .collect();
+        app.rebuild();
+        app
+    }
+
+    fn order(app: &App) -> Vec<&str> {
+        app.sessions
+            .iter()
+            .map(|session| session.session_name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn shift_j_and_k_move_the_selected_pane_s_session() {
+        let mut app = multi_session_app(&["a", "b", "c"]);
+        app.selected = 1; // in session "b"
+        app.rebuild();
+        assert!(app.move_session(Direction::Up));
+        assert_eq!(order(&app), ["b", "a", "c"]);
+        assert!(app.move_session(Direction::Down));
+        assert_eq!(order(&app), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn moving_a_session_past_an_edge_does_nothing() {
+        let mut app = multi_session_app(&["a", "b"]);
+        app.selected = 0;
+        app.rebuild();
+        assert!(!app.move_session(Direction::Up), "already first");
+        assert_eq!(order(&app), ["a", "b"]);
+
+        app.selected = 1;
+        app.rebuild();
+        assert!(!app.move_session(Direction::Down), "already last");
+        assert_eq!(order(&app), ["a", "b"]);
+    }
+
+    #[test]
+    fn reordering_moves_the_session_not_just_the_visible_row() {
+        // Under a filter the rendered list may hold only some sessions; the order we
+        // persist has to be the real one, or it would only make sense while that
+        // filter was on.
+        let mut app = multi_session_app(&["a", "b", "c"]);
+        app.selected = 2;
+        app.filter = StatusFilter::All;
+        app.rebuild();
+        assert!(app.move_session(Direction::Up));
+        assert_eq!(order(&app), ["a", "c", "b"]);
+    }
+
+    #[test]
+    fn reordering_an_empty_list_is_a_no_op() {
+        let mut app = multi_session_app(&[]);
+        assert!(!app.move_session(Direction::Down));
     }
 
     // ─── preview gating ───────────────────────────────────────────────
