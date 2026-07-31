@@ -114,7 +114,7 @@ mod tests {
 
     /// An app with `count` selectable panes and a worker whose channel is live.
     fn fixture(count: usize) -> (App, Worker) {
-        let mut app = App::new("%99".to_owned(), (40, 40));
+        let mut app = App::new(crate::ui::Surface::Sidebar, "%99".to_owned(), (40, 40));
         app.sessions = vec![SessionGroup {
             session_name: "work".to_owned(),
             session_attached: true,
@@ -273,12 +273,12 @@ mod tests {
     #[test]
     fn activating_our_own_pane_is_refused() {
         // Switching tmux to the sidebar itself would move focus into a pane the
-        // user cannot type into usefully.
+        // user cannot type into usefully. Asserted on the decision rather than by
+        // calling activate_selection, which would issue a real switch-client and
+        // move the tmux client running the test suite.
         let (mut app, worker) = fixture(1);
         let _ = &worker;
         app.own_pane = app.list.blocks[0].target.pane_id.clone();
-        app.activate_selection();
-        // Nothing to assert on tmux without a server; the guard is that this
-        // returns without issuing commands.
+        assert!(app.activation_target().is_none());
     }
 }

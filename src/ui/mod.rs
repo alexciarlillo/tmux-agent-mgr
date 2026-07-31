@@ -14,6 +14,32 @@ use crate::app::{App, StatusFilter};
 use crate::model::AgentState;
 use text::{pad_to, truncate, width};
 
+/// Where the TUI is being drawn.
+///
+/// The same list code serves both, but the two surfaces have genuinely different
+/// jobs and the differences are worth naming rather than sprinkling `if` on a
+/// bool. A sidebar is narrow, lives for hours beside your work, and is the reason
+/// the redraw policy in [`crate::app`] exists. A popup is wide, covers the screen,
+/// and exists to answer one question and get out of the way.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum Surface {
+    #[default]
+    Sidebar,
+    Popup,
+}
+
+impl Surface {
+    /// Whether jumping to a pane should also close the TUI.
+    ///
+    /// A popup is a transient chooser: leaving it open on top of the pane you just
+    /// asked to see would hide the thing you navigated to. A sidebar is the
+    /// opposite — you jump around *with* it open, which is the whole point of it
+    /// being persistent.
+    pub fn dismisses_on_activate(self) -> bool {
+        self == Self::Popup
+    }
+}
+
 /// Lines reserved at the top and bottom of the pane. Both are fixed so the list
 /// viewport height is stable and scrolling doesn't jump when a count changes.
 pub const HEADER_HEIGHT: u16 = 1;

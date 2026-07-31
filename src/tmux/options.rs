@@ -114,6 +114,17 @@ pub mod conf_only {
     pub const CFG_TAB_STATUS: &str = "@agent_mgr_tab_status";
     /// When `on`, bind vim-aware `C-h/j/k/l` pane and session navigation.
     pub const CFG_NAV: &str = "@agent_mgr_nav";
+    /// Prefix key toggling the sidebar in the current window.
+    pub const CFG_KEY: &str = "@agent_mgr_key";
+    /// Prefix key toggling the sidebar in every window.
+    pub const CFG_KEY_ALL: &str = "@agent_mgr_key_all";
+    /// Prefix-less key opening the full-screen popup; `none` binds nothing.
+    pub const CFG_KEY_POPUP: &str = "@agent_mgr_key_popup";
+    /// Whether this tmux can host the popup surface (`display-popup -B -E`,
+    /// tmux >= 3.3). Written by `tmux-agent-mgr.tmux` at load, read by the conf to
+    /// decide whether binding the popup key would produce a working key or one
+    /// that only fails when pressed.
+    pub const HAS_POPUP: &str = "@agent_mgr_has_popup";
 }
 
 /// Read a global option, treating empty as unset.
@@ -149,6 +160,11 @@ pub fn clear_hook_state(pane_id: &str) {
 /// so without this the two could silently drift apart.
 #[cfg(test)]
 const SHIPPED_CONF: &str = include_str!("../../agent-mgr.conf");
+
+/// The TPM entry point, for the same reason: it is the only writer of
+/// [`conf_only::HAS_POPUP`], and the conf is its only reader.
+#[cfg(test)]
+const SHIPPED_TMUX: &str = include_str!("../../tmux-agent-mgr.tmux");
 
 #[cfg(test)]
 mod tests {
@@ -195,12 +211,43 @@ mod tests {
             CFG_AGENTS_ONLY,
             conf_only::CFG_TAB_STATUS,
             conf_only::CFG_NAV,
+            conf_only::CFG_KEY,
+            conf_only::CFG_KEY_ALL,
+            conf_only::CFG_KEY_POPUP,
+            conf_only::HAS_POPUP,
         ] {
             assert!(
                 SHIPPED_CONF.contains(key),
                 "{key} is not mentioned in agent-mgr.conf"
             );
         }
+    }
+
+    #[test]
+    fn the_popup_capability_flag_is_written_by_the_entrypoint_and_read_by_the_conf() {
+        // Split across the bash/tmux boundary with no compiler between them: the
+        // entry point decides, the conf acts on it. A rename on either side would
+        // silently stop binding the popup key.
+        assert!(
+            SHIPPED_TMUX.contains(conf_only::HAS_POPUP),
+            "tmux-agent-mgr.tmux must publish {}",
+            conf_only::HAS_POPUP
+        );
+        assert!(SHIPPED_CONF.contains(conf_only::HAS_POPUP));
+    }
+
+    #[test]
+    fn the_conf_binds_the_popup_subcommand_main_actually_dispatches() {
+        // `agent-mgr popup` is a string in a tmux binding on one side and a match
+        // arm in main.rs on the other; nothing else ties them together.
+        assert!(
+            SHIPPED_CONF.contains("popup"),
+            "the conf must invoke the popup subcommand"
+        );
+        assert!(
+            SHIPPED_CONF.contains("display-popup"),
+            "the popup key must open a display-popup"
+        );
     }
 
     #[test]

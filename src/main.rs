@@ -2,7 +2,8 @@
 //!
 //! | invocation | role |
 //! |---|---|
-//! | *(no args)* | the TUI itself, running inside a sidebar pane or a popup |
+//! | *(no args)* | the TUI as a persistent sidebar pane |
+//! | `popup` | the same TUI full-screen in a `display-popup`, dismissed on jump |
 //! | `toggle <window-id> [path]` | create or kill the sidebar pane in one window |
 //! | `toggle-all` | same, across every window |
 //! | `resize <window-id>` | re-clamp the sidebar width after a window resize |
@@ -46,6 +47,11 @@ fn main() {
         Some("resize") => pane::cmd_resize(&rest),
         Some("auto-close") => pane::cmd_auto_close(&rest),
         Some("daemon") => daemon::cmd_daemon(&rest),
+        // The two TUI entry points. Same loop, same keymap; the surface decides
+        // width, whether a preview is worth its cost, and whether jumping to a
+        // pane also closes us.
+        None => tui(ui::Surface::Sidebar),
+        Some("popup") => tui(ui::Surface::Popup),
         Some("--version" | "version") => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             0
@@ -54,16 +60,20 @@ fn main() {
             eprintln!("agent-mgr: unknown subcommand {other:?}");
             2
         }
-        None => match run_tui() {
-            Ok(()) => 0,
-            Err(err) => {
-                eprintln!("agent-mgr: {err}");
-                1
-            }
-        },
     };
 
     std::process::exit(code);
+}
+
+/// Run the TUI on `surface`, reporting any failure as an exit code.
+fn tui(surface: ui::Surface) -> i32 {
+    match run_tui(surface) {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("agent-mgr: {err}");
+            1
+        }
+    }
 }
 
 /// Restores the terminal on the way out, including on a panic unwind — a TUI
@@ -90,28 +100,36 @@ impl Drop for TuiSession {
     }
 }
 
-fn run_tui() -> io::Result<()> {
-    let tmux_pane = std::env::var("TMUX_PANE").unwrap_or_default();
-    if tmux_pane.is_empty() {
-        return Err(io::Error::other(
-            "TMUX_PANE is not set — run this inside tmux (prefix+e toggles the sidebar)",
-        ));
-    }
+fn run_tui(surface: ui::Surface) -> io::Result<()> {
+    // A sidebar *is* a pane, so it knows its own id and must keep itself out of
+    // its own list. A popup is an overlay owned by the client rather than a pane
+    // in any window, so it has nothing to exclude — and deliberately does not
+    // touch the origin pane's options: TMUX_PANE in a popup is whichever pane was
+    // active when it opened, which may well be a real sidebar whose published pid
+    // we would otherwise overwrite with our own short-lived one.
+    let own_pane = match surface {
+        ui::Surface::Sidebar => {
+            let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+            if pane.is_empty() {
+                return Err(io::Error::other(
+                    "TMUX_PANE is not set — run this inside tmux (prefix+e toggles the sidebar)",
+                ));
+            }
+            // Publish our pid so the focus hooks in agent-mgr.conf can find us.
+            tmux::set_pane_option_raw(&pane, tmux::PANE_TUI_PID, &std::process::id().to_string());
+            pane
+        }
+        ui::Surface::Popup => String::new(),
+    };
 
     install_sigusr1_handler();
-    // Publish our pid so the focus hooks in agent-mgr.conf can find us.
-    tmux::set_pane_option_raw(
-        &tmux_pane,
-        tmux::PANE_TUI_PID,
-        &std::process::id().to_string(),
-    );
     // One daemon serves every sidebar; this is a no-op when one already runs.
     daemon::ensure_running();
 
     let mut stdout = io::stdout();
     let _session = TuiSession::enter(&mut stdout)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    app::run(&mut terminal, tmux_pane, &NEEDS_REFRESH)
+    app::run(&mut terminal, surface, own_pane, &NEEDS_REFRESH)
 }
 
 fn install_sigusr1_handler() {

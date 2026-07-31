@@ -39,7 +39,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::daemon;
 use crate::model::{AgentState, AgentStatus, SessionGroup};
 use crate::tmux;
-use crate::ui::{self, Counts, rows::RenderedList, theme::Theme};
+use crate::ui::{self, Counts, Surface, rows, rows::RenderedList, theme::Theme};
 
 /// Spinner frame duration. Ten frames, so a full cycle is 1.5 s.
 const SPINNER_INTERVAL: Duration = Duration::from_millis(150);
@@ -82,7 +82,9 @@ impl StatusFilter {
 }
 
 pub struct App {
-    /// Our own pane, excluded from the list and never navigated to.
+    pub surface: Surface,
+    /// Our own pane, excluded from the list and never navigated to. Empty in a
+    /// popup, which is not a pane in any window and so has nothing to exclude.
     pub own_pane: String,
     pub theme: Theme,
     /// The full tree as collected, before filtering.
@@ -104,8 +106,9 @@ pub struct App {
 }
 
 impl App {
-    fn new(own_pane: String, size: (u16, u16)) -> Self {
+    fn new(surface: Surface, own_pane: String, size: (u16, u16)) -> Self {
         Self {
+            surface,
             own_pane,
             theme: Theme::from_tmux(),
             sessions: Vec::new(),
@@ -241,20 +244,35 @@ impl App {
         first
     }
 
+    /// Which pane `Enter` would jump to, or `None` if there is nowhere to go.
+    ///
+    /// Split out from [`Self::activate_selection`] so the decision — including the
+    /// refusal to navigate to our own pane — is testable without issuing
+    /// `switch-client`, which in a test run would move the developer's own tmux
+    /// client out from under them.
+    pub fn activation_target(&self) -> Option<rows::PaneTarget> {
+        let target = &self.list.blocks.get(self.selected)?.target;
+        // An empty `own_pane` (a popup) must not match a real pane id.
+        if !self.own_pane.is_empty() && target.pane_id == self.own_pane {
+            return None;
+        }
+        Some(target.clone())
+    }
+
     /// Jump tmux to the selected pane, and mark its window as caught up.
     fn activate_selection(&mut self) {
-        let Some(block) = self.list.blocks.get(self.selected) else {
+        let Some(target) = self.activation_target() else {
             return;
         };
-        let target = block.target.clone();
-        if target.pane_id == self.own_pane {
-            return;
-        }
         tmux::run_tmux_quiet(&["switch-client", "-t", &target.session_name]);
         tmux::run_tmux_quiet(&["select-window", "-t", &target.window_id]);
         tmux::run_tmux_quiet(&["select-pane", "-t", &target.pane_id]);
         // Visiting a window is how you acknowledge "this finished".
         daemon::mark_window_seen(&target.window_id);
+        // A popup is covering the pane it just switched to; get out of the way.
+        if self.surface.dismisses_on_activate() {
+            self.quit = true;
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -322,11 +340,12 @@ fn fingerprint(app: &App) -> u64 {
 
 pub fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    surface: Surface,
     tmux_pane: String,
     needs_refresh: &'static AtomicBool,
 ) -> io::Result<()> {
     let size = terminal.size()?;
-    let mut app = App::new(tmux_pane, (size.width, size.height));
+    let mut app = App::new(surface, tmux_pane, (size.width, size.height));
 
     let worker = worker::spawn(tmux::global_bool(tmux::CFG_AGENTS_ONLY, false));
     // Nothing to show until the first collection lands; ask for it now rather
@@ -456,7 +475,11 @@ mod tests {
     }
 
     fn app_with(panes: Vec<PaneInfo>, height: u16) -> App {
-        let mut app = App::new("%99".to_owned(), (40, height));
+        surfaced_app(Surface::Sidebar, panes, height)
+    }
+
+    fn surfaced_app(surface: Surface, panes: Vec<PaneInfo>, height: u16) -> App {
+        let mut app = App::new(surface, "%99".to_owned(), (40, height));
         app.sessions = tree(panes);
         app.rebuild();
         app
@@ -723,6 +746,24 @@ mod tests {
         app.size = (60, 40);
         app.rebuild();
         assert_ne!(fingerprint(&app), before);
+    }
+
+    // ─── surfaces ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_popup_dismisses_on_activate_and_a_sidebar_does_not() {
+        // The sidebar's whole value is that you keep jumping around with it open.
+        assert!(Surface::Popup.dismisses_on_activate());
+        assert!(!Surface::Sidebar.dismisses_on_activate());
+    }
+
+    #[test]
+    fn a_popup_has_no_own_pane_to_refuse() {
+        // A popup is not a pane in any window, so every listed pane is a legitimate
+        // jump target — including the one the binding fired from.
+        let mut app = surfaced_app(Surface::Popup, vec![pane("%1", AgentState::Idle, true)], 40);
+        app.own_pane = String::new();
+        assert_eq!(app.activation_target().unwrap().pane_id, "%1");
     }
 
     #[test]

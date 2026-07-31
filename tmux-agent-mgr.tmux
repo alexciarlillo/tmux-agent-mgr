@@ -19,6 +19,21 @@ if [[ -n "$version" ]]; then
     fi
 fi
 
+# The popup surface needs `display-popup -B -E`, which landed in tmux 3.3. The
+# sidebar works fine below that, so this degrades to "no popup key" rather than
+# refusing to load — and it is decided here, once, instead of binding a key that
+# only fails when pressed. An unparseable version optimistically counts as
+# capable: attempting and erroring is easier to diagnose than a key that silently
+# does nothing.
+has_popup=on
+if [[ -n "$version" ]]; then
+    minor="${version##*.}"
+    if (( major < 3 || (major == 3 && minor < 3) )); then
+        has_popup=off
+    fi
+fi
+tmux set-option -g @agent_mgr_has_popup "$has_popup"
+
 # Prefer a release build, then a debug build, then anything on PATH. The debug
 # fallback is what makes `cargo build` (without --release) enough while working on
 # the plugin itself.
