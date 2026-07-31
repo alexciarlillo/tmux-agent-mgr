@@ -38,6 +38,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::daemon;
 use crate::model::{AgentState, AgentStatus, SessionGroup};
+use crate::nav::{self, Direction};
 use crate::tmux;
 use crate::ui::{self, Counts, Surface, rows, rows::RenderedList, theme::Theme};
 
@@ -95,6 +96,11 @@ pub struct App {
     pub selected: usize,
     /// First visible line of the list.
     pub scroll: usize,
+    /// Show the relative-number gutter. On by default: it is what makes a counted
+    /// motion like `10j` something you can aim rather than guess at.
+    pub numbers: bool,
+    /// Digits typed so far, awaiting a motion to consume them.
+    pub pending_count: Option<usize>,
     pub spinner: usize,
     pub list: RenderedList,
     pub size: (u16, u16),
@@ -116,6 +122,8 @@ impl App {
             counts: Counts::default(),
             selected: 0,
             scroll: 0,
+            numbers: true,
+            pending_count: None,
             spinner: 0,
             list: RenderedList {
                 lines: Vec::new(),
@@ -167,14 +175,14 @@ impl App {
             .get(self.selected)
             .map(|block| block.target.pane_id.clone());
 
-        self.list = ui::rows::build(
-            &filtered,
-            self.selected,
-            self.size.0 as usize,
-            self.spinner,
-            tmux::unix_timestamp(),
-            &self.theme,
-        );
+        let mut opts = rows::Options {
+            selected: self.selected,
+            total_width: self.size.0 as usize,
+            spinner: self.spinner,
+            now: tmux::unix_timestamp(),
+            numbers: self.numbers,
+        };
+        self.list = rows::build(&filtered, &opts, &self.theme);
 
         if let Some(pane_id) = anchor
             && let Some(index) = self
@@ -186,15 +194,10 @@ impl App {
         {
             self.selected = index;
             // Rebuild once more so the highlight lands on the row we just moved
-            // to rather than on whatever now occupies the old index.
-            self.list = ui::rows::build(
-                &filtered,
-                self.selected,
-                self.size.0 as usize,
-                self.spinner,
-                tmux::unix_timestamp(),
-                &self.theme,
-            );
+            // to rather than on whatever now occupies the old index — and, with the
+            // gutter on, so the relative numbers count from the right row.
+            opts.selected = index;
+            self.list = rows::build(&filtered, &opts, &self.theme);
         }
 
         self.clamp_selection();
@@ -276,14 +279,26 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.list.blocks.is_empty() {
-            return;
-        }
-        let last = self.list.blocks.len() - 1;
-        self.selected = match delta {
-            delta if delta < 0 => self.selected.saturating_sub(delta.unsigned_abs()),
-            delta => (self.selected + delta as usize).min(last),
+        let (direction, count) = if delta < 0 {
+            (Direction::Up, delta.unsigned_abs())
+        } else {
+            (Direction::Down, delta as usize)
         };
+        self.selected = nav::step(&self.list.blocks, self.selected, direction, count);
+    }
+
+    /// Move by a pending count if one was typed, otherwise by one.
+    fn move_counted(&mut self, direction: Direction) {
+        let count = nav::take_count(&mut self.pending_count);
+        self.selected = nav::step(&self.list.blocks, self.selected, direction, count);
+    }
+
+    /// `H` / `L`: jump a whole session.
+    fn jump_session(&mut self, direction: Direction) {
+        // A count would have to mean "N sessions over", which nobody can aim; drop
+        // it rather than have it silently apply to the next motion instead.
+        self.pending_count = None;
+        self.selected = nav::session_edge(&self.list.blocks, self.selected, direction);
     }
 }
 
@@ -335,6 +350,8 @@ fn fingerprint(app: &App) -> u64 {
     app.size.hash(&mut hasher);
     app.filter.hash(&mut hasher);
     app.counts.hash(&mut hasher);
+    // A half-typed count is shown in the footer, so it is part of the screen.
+    app.pending_count.hash(&mut hasher);
     hasher.finish()
 }
 

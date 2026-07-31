@@ -156,6 +156,23 @@ fn filter_label(filter: StatusFilter) -> &'static str {
 /// A filter you forgot you set is the classic "why is my agent missing" bug.
 fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     let theme = &app.theme;
+    // A half-typed count has to be visible: without an echo you cannot tell a
+    // pending `1` from a keystroke that was dropped, and you find out only by
+    // pressing `j` and going somewhere unexpected.
+    if let Some(count) = app.pending_count {
+        let text = truncate(&format!("{count}"), total_width);
+        let content_width = width(&text);
+        return Line::from(vec![
+            Span::styled(
+                text,
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(pad_to(content_width, total_width)),
+        ]);
+    }
+
     let label = filter_label(app.filter).to_owned();
     let hidden = app.hidden_count();
     let text = if hidden > 0 {

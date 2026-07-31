@@ -64,23 +64,75 @@ impl RenderedList {
     }
 }
 
+/// Everything the render needs beyond the tree itself.
+///
+/// A struct rather than a growing positional argument list: `selected` and
+/// `spinner` are both small integers with entirely different meanings, and at the
+/// call site `build(&sessions, 0, 40, 7, ...)` says nothing about which is which.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Index into the resulting [`RenderedList::blocks`]. Out of range simply
+    /// highlights nothing, so a caller holding a stale index cannot panic.
+    pub selected: usize,
+    pub total_width: usize,
+    pub spinner: usize,
+    pub now: u64,
+    /// Show the vim-style relative-number gutter that makes `10j` countable.
+    pub numbers: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            total_width: 40,
+            spinner: 0,
+            now: 0,
+            numbers: false,
+        }
+    }
+}
+
 /// A partially built list. Threading a builder through keeps every push site
 /// honest about recording line indexes.
 struct Builder<'a> {
     theme: &'a Theme,
-    /// Total columns available, including the one-cell selection marker gutter.
+    /// Total columns available, including the number gutter and the one-cell
+    /// selection marker.
     total_width: usize,
     spinner: usize,
     now: u64,
+    /// Columns reserved for relative numbers; 0 when the gutter is off.
+    number_width: usize,
+    /// Number to print in the gutter on the next line pushed, if any. Consumed by
+    /// [`Self::push`], so a pane's status line carries the number and the context
+    /// lines beneath it stay blank — the number identifies a *block*, and blocks
+    /// are what motions move between.
+    pending_number: Option<usize>,
     lines: Vec<Line<'static>>,
     plain: Vec<String>,
     blocks: Vec<Block>,
 }
 
 impl Builder<'_> {
-    /// Columns available after the marker gutter and its trailing space.
+    /// Columns available after the number gutter, the marker and its trailing
+    /// space.
     fn inner(&self, indent: usize) -> usize {
-        self.total_width.saturating_sub(2 + indent)
+        self.total_width
+            .saturating_sub(2 + indent + self.number_width)
+    }
+
+    /// Render and clear the pending gutter number.
+    fn gutter(&mut self, base: Style) -> Option<Span<'static>> {
+        let number = self.pending_number.take();
+        if self.number_width == 0 {
+            return None;
+        }
+        let text = match number {
+            Some(number) => format!("{number:>width$}", width = self.number_width),
+            None => " ".repeat(self.number_width),
+        };
+        Some(Span::styled(text, base.fg(self.theme.muted)))
     }
 
     /// Push one line: a marker cell, an indent, the content, and padding out to
@@ -97,7 +149,10 @@ impl Builder<'_> {
             Some(color) => Style::default().bg(color),
             None => Style::default(),
         };
-        let mut spans = Vec::with_capacity(content.len() + 4);
+        let mut spans = Vec::with_capacity(content.len() + 5);
+        if let Some(gutter) = self.gutter(base) {
+            spans.push(gutter);
+        }
         spans.push(marker.unwrap_or_else(|| Span::styled(" ", base)));
         spans.push(Span::styled(" ".repeat(1 + indent), base));
         spans.extend(content);
@@ -130,22 +185,28 @@ impl Builder<'_> {
 }
 
 /// Render the session tree.
-///
-/// `selected` indexes [`RenderedList::blocks`]; out-of-range simply renders
-/// nothing highlighted, so a caller mid-refresh can't panic on a stale index.
-pub fn build(
-    sessions: &[SessionGroup],
-    selected: usize,
-    total_width: usize,
-    spinner: usize,
-    now: u64,
-    theme: &Theme,
-) -> RenderedList {
+pub fn build(sessions: &[SessionGroup], opts: &Options, theme: &Theme) -> RenderedList {
+    // The gutter has to be sized before any row is built, because it changes how
+    // many columns every row has to work with. Counting panes up front is cheap
+    // next to rendering them.
+    let pane_count: usize = sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .map(|window| window.panes.len())
+        .sum();
+    let number_width = if opts.numbers {
+        crate::nav::number_width(pane_count)
+    } else {
+        0
+    };
+
     let mut builder = Builder {
         theme,
-        total_width: total_width.max(8),
-        spinner,
-        now,
+        total_width: opts.total_width.max(8),
+        spinner: opts.spinner,
+        now: opts.now,
+        number_width,
+        pending_number: None,
         lines: Vec::new(),
         plain: Vec::new(),
         blocks: Vec::new(),
@@ -158,13 +219,16 @@ pub fn build(
             let multi_pane = window.panes.len() > 1;
             for pane in &window.panes {
                 let block = builder.blocks.len();
+                if opts.numbers {
+                    builder.pending_number = Some(crate::nav::relative_number(opts.selected, block));
+                }
                 pane_block(
                     &mut builder,
                     session,
                     window,
                     pane,
                     multi_pane,
-                    block == selected,
+                    block == opts.selected,
                 );
             }
         }
@@ -498,7 +562,19 @@ mod tests {
     }
 
     fn render(sessions: &[SessionGroup], selected: usize, width: usize) -> RenderedList {
-        build(sessions, selected, width, 0, 1_000, &Theme::default())
+        opts_render(
+            sessions,
+            &Options {
+                selected,
+                total_width: width,
+                now: 1_000,
+                ..Options::default()
+            },
+        )
+    }
+
+    fn opts_render(sessions: &[SessionGroup], opts: &Options) -> RenderedList {
+        build(sessions, opts, &Theme::default())
     }
 
     #[test]
@@ -681,6 +757,80 @@ mod tests {
         assert_eq!(list.block_at_line(9_999), None);
     }
 
+    // ─── the relative-number gutter ───────────────────────────────────
+
+    #[test]
+    fn the_gutter_counts_outward_from_the_selected_pane() {
+        let panes: Vec<PaneInfo> = (0..4)
+            .map(|index| pane(&format!("%{index}"), AgentStatus::unknown()))
+            .collect();
+        let list = opts_render(
+            &tree(panes),
+            &Options {
+                selected: 1,
+                numbers: true,
+                ..Options::default()
+            },
+        );
+        // Two header lines, then one line per pane.
+        let gutters: Vec<&str> = list.plain[2..6]
+            .iter()
+            .map(|line| line[..1].trim_end())
+            .collect();
+        assert_eq!(gutters, ["1", "0", "1", "2"]);
+    }
+
+    #[test]
+    fn only_a_panes_first_line_is_numbered() {
+        // The number names a block, and blocks are what motions move between;
+        // numbering the branch row too would imply `2j` could land on it.
+        let mut detailed = pane("%1", agent_status(AgentState::Blocked));
+        detailed.branch = "main".to_owned();
+        let list = opts_render(
+            &tree(vec![detailed]),
+            &Options {
+                numbers: true,
+                ..Options::default()
+            },
+        );
+        assert_eq!(&list.plain[2][..1], "0", "the status line carries it");
+        assert_eq!(&list.plain[3][..1], " ", "the branch line does not");
+    }
+
+    #[test]
+    fn the_gutter_takes_its_columns_from_the_content_not_the_edge() {
+        // Every line must still be exactly total_width, or rows wrap and desync
+        // everything below them.
+        let panes: Vec<PaneInfo> = (0..12)
+            .map(|index| pane(&format!("%{index}"), AgentStatus::unknown()))
+            .collect();
+        let list = opts_render(
+            &tree(panes),
+            &Options {
+                total_width: 30,
+                numbers: true,
+                ..Options::default()
+            },
+        );
+        for line in &list.plain {
+            assert_eq!(width(line), 30, "{line:?}");
+        }
+        // 12 panes means distances up to 11, so the gutter is two cells wide.
+        assert_eq!(&list.plain[2][..2], " 0");
+    }
+
+    #[test]
+    fn the_gutter_is_absent_entirely_when_numbers_are_off() {
+        let list = render(&tree(vec![pane("%1", AgentStatus::unknown())]), 0, 40);
+        // Without a gutter the marker cell is first, and an inactive pane's marker
+        // is a space — so the leading cells are the indent, not a number.
+        assert!(
+            list.plain[2].starts_with("    "),
+            "unexpected leading cells: {:?}",
+            &list.plain[2][..6]
+        );
+    }
+
     #[test]
     fn an_out_of_range_selection_renders_without_panicking() {
         let list = render(&tree(vec![pane("%1", AgentStatus::unknown())]), 99, 40);
@@ -703,16 +853,16 @@ mod tests {
             pane("%1", agent_status(AgentState::Idle)),
             pane("%2", agent_status(AgentState::Blocked)),
         ]);
-        let first = build(&sessions, 0, 40, 0, 1_000, &Theme::default());
-        let later = build(&sessions, 0, 40, 7, 1_000, &Theme::default());
+        let first = opts_render(&sessions, &Options { now: 1_000, ..Options::default() });
+        let later = opts_render(&sessions, &Options { spinner: 7, now: 1_000, ..Options::default() });
         assert_eq!(first.plain, later.plain);
     }
 
     #[test]
     fn a_working_pane_does_change_between_spinner_frames() {
         let sessions = tree(vec![pane("%1", agent_status(AgentState::Working))]);
-        let first = build(&sessions, 0, 40, 0, 1_000, &Theme::default());
-        let later = build(&sessions, 0, 40, 1, 1_000, &Theme::default());
+        let first = opts_render(&sessions, &Options { now: 1_000, ..Options::default() });
+        let later = opts_render(&sessions, &Options { spinner: 1, now: 1_000, ..Options::default() });
         assert_ne!(first.plain, later.plain);
     }
 
@@ -738,8 +888,8 @@ mod tests {
         sessions[0].windows[0].panes[0].status.agent = None;
         sessions[0].windows[0].panes[0].current_command = "a-really-long-command-name".to_owned();
 
-        let short_run = build(&sessions, 0, 30, 0, 30, &Theme::default());
-        let long_run = build(&sessions, 0, 30, 0, 90_000, &Theme::default());
+        let short_run = opts_render(&sessions, &Options { total_width: 30, now: 30, ..Options::default() });
+        let long_run = opts_render(&sessions, &Options { total_width: 30, now: 90_000, ..Options::default() });
 
         // Everything before the truncation ellipsis is the label we kept.
         let label_of = |line: &str| line.split('…').next().unwrap_or_default().to_owned();

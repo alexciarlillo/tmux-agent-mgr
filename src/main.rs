@@ -19,6 +19,7 @@ mod daemon;
 mod detect;
 mod git;
 mod model;
+mod nav;
 mod pane;
 mod tmux;
 mod ui;
@@ -117,6 +118,12 @@ fn run_tui(surface: ui::Surface) -> io::Result<()> {
             }
             // Publish our pid so the focus hooks in agent-mgr.conf can find us.
             tmux::set_pane_option_raw(&pane, tmux::PANE_TUI_PID, &std::process::id().to_string());
+            // Claim the sidebar role ourselves rather than trusting whoever spawned
+            // us. `toggle` also sets it, but only *after* the split returns — so
+            // there is a window in which we are running and unmarked, and our first
+            // collection would list our own pane before it vanished a second later.
+            // Doing it here also means a hand-run `agent-mgr` behaves correctly.
+            tmux::set_pane_option_raw(&pane, tmux::PANE_ROLE, tmux::PANE_ROLE_SIDEBAR);
             pane
         }
         ui::Surface::Popup => String::new(),

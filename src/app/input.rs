@@ -2,11 +2,14 @@
 //!
 //! Vim movement is the default rather than an option, and every binding that
 //! could mean two things resolves the same way it would in a pager: `j`/`k` move,
-//! `g`/`G` jump to the ends, `Enter` acts.
+//! `g`/`G` jump to the ends, `Enter` acts. Counts work as they do in vim — `10j`
+//! moves ten panes, `12G` goes to the twelfth — which is only aimable because the
+//! relative-number gutter shows the distances (see [`crate::nav`]).
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use super::{App, worker::Worker};
+use crate::nav::{self, Direction};
 use crate::ui;
 
 pub fn handle(event: Event, app: &mut App, worker: &Worker) {
@@ -41,18 +44,41 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
         KeyCode::Char('d') if ctrl => app.move_selection(page(app)),
         KeyCode::Char('u') if ctrl => app.move_selection(-page(app)),
 
+        // A pending count is a mode you can be stuck in, so Esc has to mean "never
+        // mind" before it means "close" — otherwise a mistyped `12` leaves you
+        // unable to back out without also losing the sidebar.
+        KeyCode::Esc if app.pending_count.is_some() => app.pending_count = None,
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
-        KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
-        KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
-        KeyCode::Char('g') | KeyCode::Home => app.selected = 0,
+
+        // Digits accumulate a count; `0` with nothing pending falls through and is
+        // ignored rather than being swallowed as a no-op count.
+        KeyCode::Char(ch) if !ctrl && nav::push_count(&mut app.pending_count, ch) => {}
+
+        KeyCode::Char('j') | KeyCode::Down => app.move_counted(Direction::Down),
+        KeyCode::Char('k') | KeyCode::Up => app.move_counted(Direction::Up),
+        KeyCode::Char('H') | KeyCode::Left => app.jump_session(Direction::Up),
+        KeyCode::Char('L') | KeyCode::Right => app.jump_session(Direction::Down),
+        KeyCode::Char('g') | KeyCode::Home => {
+            app.pending_count = None;
+            app.selected = 0;
+        }
         KeyCode::Char('G') | KeyCode::End => {
-            app.selected = app.list.blocks.len().saturating_sub(1);
+            // `NG` in vim goes to line N; here it goes to pane N, counting from the
+            // top, which is the only reading that makes `G` and the gutter agree.
+            app.selected = match app.pending_count.take() {
+                Some(number) => number.saturating_sub(1).min(last_block(app)),
+                None => last_block(app),
+            };
         }
         KeyCode::Enter | KeyCode::Char(' ') => app.activate_selection(),
         KeyCode::Tab => app.filter = app.filter.next(),
         KeyCode::Char('r') => worker.request_refresh(),
         _ => {}
     }
+}
+
+fn last_block(app: &App) -> usize {
+    app.list.blocks.len().saturating_sub(1)
 }
 
 /// One screenful of pane rows, for Ctrl-D / Ctrl-U.
@@ -114,18 +140,33 @@ mod tests {
 
     /// An app with `count` selectable panes and a worker whose channel is live.
     fn fixture(count: usize) -> (App, Worker) {
+        multi_session_fixture(&[("work", count)])
+    }
+
+    /// An app whose panes are spread across the named sessions, for session jumps.
+    fn multi_session_fixture(sessions: &[(&str, usize)]) -> (App, Worker) {
         let mut app = App::new(crate::ui::Surface::Sidebar, "%99".to_owned(), (40, 40));
-        app.sessions = vec![SessionGroup {
-            session_name: "work".to_owned(),
-            session_attached: true,
-            windows: vec![WindowInfo {
-                window_id: "@1".to_owned(),
-                window_index: "1".to_owned(),
-                window_name: "w".to_owned(),
-                window_active: true,
-                panes: (0..count).map(|i| pane(&format!("%{i}"))).collect(),
-            }],
-        }];
+        let mut next_pane = 0;
+        app.sessions = sessions
+            .iter()
+            .enumerate()
+            .map(|(index, (name, count))| SessionGroup {
+                session_name: (*name).to_owned(),
+                session_attached: true,
+                windows: vec![WindowInfo {
+                    window_id: format!("@{index}"),
+                    window_index: index.to_string(),
+                    window_name: "w".to_owned(),
+                    window_active: index == 0,
+                    panes: (0..*count)
+                        .map(|_| {
+                            next_pane += 1;
+                            pane(&format!("%{}", next_pane - 1))
+                        })
+                        .collect(),
+                }],
+            })
+            .collect();
         app.rebuild();
         (app, crate::app::worker::spawn(false))
     }
@@ -180,6 +221,103 @@ mod tests {
         let (mut app, worker) = fixture(0);
         press(&mut app, &worker, KeyCode::Char('G'));
         assert_eq!(app.selected, 0);
+    }
+
+    // ─── counted motions ──────────────────────────────────────────────
+
+    #[test]
+    fn a_typed_count_moves_that_many_panes() {
+        let (mut app, worker) = fixture(30);
+        for ch in ['1', '2'] {
+            press(&mut app, &worker, KeyCode::Char(ch));
+        }
+        assert_eq!(app.pending_count, Some(12));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.selected, 12);
+        assert_eq!(app.pending_count, None, "the count is spent");
+    }
+
+    #[test]
+    fn a_count_does_not_leak_into_the_next_motion() {
+        let (mut app, worker) = fixture(30);
+        press(&mut app, &worker, KeyCode::Char('5'));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.selected, 5);
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.selected, 6, "second j must move exactly one");
+    }
+
+    #[test]
+    fn esc_cancels_a_pending_count_before_it_closes_anything() {
+        // Otherwise a mistyped count is a mode you cannot leave without also
+        // losing the sidebar.
+        let (mut app, worker) = fixture(5);
+        press(&mut app, &worker, KeyCode::Char('9'));
+        press(&mut app, &worker, KeyCode::Esc);
+        assert_eq!(app.pending_count, None);
+        assert!(!app.quit, "the first Esc only cancels the count");
+        press(&mut app, &worker, KeyCode::Esc);
+        assert!(app.quit, "a second Esc closes as usual");
+    }
+
+    #[test]
+    fn a_bare_zero_is_not_swallowed_as_a_count() {
+        let (mut app, worker) = fixture(5);
+        press(&mut app, &worker, KeyCode::Char('0'));
+        assert_eq!(app.pending_count, None);
+        // But it is a digit once a count is under way.
+        press(&mut app, &worker, KeyCode::Char('2'));
+        press(&mut app, &worker, KeyCode::Char('0'));
+        assert_eq!(app.pending_count, Some(20));
+    }
+
+    #[test]
+    fn counted_shift_g_goes_to_that_pane_from_the_top() {
+        let (mut app, worker) = fixture(30);
+        for ch in ['1', '5'] {
+            press(&mut app, &worker, KeyCode::Char(ch));
+        }
+        press(&mut app, &worker, KeyCode::Char('G'));
+        // 15G is the fifteenth pane, which is index 14.
+        assert_eq!(app.selected, 14);
+
+        // Bare G still means "last".
+        press(&mut app, &worker, KeyCode::Char('G'));
+        assert_eq!(app.selected, 29);
+    }
+
+    #[test]
+    fn a_counted_jump_past_the_end_lands_on_the_last_pane() {
+        let (mut app, worker) = fixture(5);
+        for ch in ['9', '9'] {
+            press(&mut app, &worker, KeyCode::Char(ch));
+        }
+        press(&mut app, &worker, KeyCode::Char('G'));
+        assert_eq!(app.selected, 4);
+    }
+
+    // ─── session jumps ────────────────────────────────────────────────
+
+    #[test]
+    fn shift_l_and_shift_h_jump_between_sessions() {
+        let (mut app, worker) = multi_session_fixture(&[("work", 3), ("ops", 2)]);
+        press(&mut app, &worker, KeyCode::Char('L'));
+        assert_eq!(app.list.blocks[app.selected].target.session_name, "ops");
+        press(&mut app, &worker, KeyCode::Char('H'));
+        assert_eq!(app.list.blocks[app.selected].target.session_name, "work");
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn a_session_jump_discards_a_pending_count() {
+        // "3L" has no sensible meaning, and leaving the count pending would make it
+        // silently apply to whatever motion came next.
+        let (mut app, worker) = multi_session_fixture(&[("work", 2), ("ops", 2)]);
+        press(&mut app, &worker, KeyCode::Char('3'));
+        press(&mut app, &worker, KeyCode::Char('L'));
+        assert_eq!(app.pending_count, None);
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.selected, 3, "must have moved one, not three");
     }
 
     #[test]
