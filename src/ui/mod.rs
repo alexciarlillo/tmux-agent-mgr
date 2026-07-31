@@ -132,10 +132,13 @@ fn header_line(app: &App, total_width: usize) -> Line<'static> {
 /// with no filter, and saying which one it is saves the user hunting for panes
 /// that were never missing.
 fn empty_state(app: &App, total_width: usize) -> Line<'static> {
-    let text = if app.filter == StatusFilter::All {
-        "no panes".to_owned()
-    } else {
-        format!("nothing {} — Tab to change", filter_label(app.filter))
+    // Name whichever narrowing emptied the list, and how to undo that specific one.
+    // "no panes" when a search is active sends you looking for panes that were
+    // never missing.
+    let text = match (&app.search, app.filter) {
+        (Some(search), _) => format!("no match for {:?} — Esc to clear", search.query),
+        (None, StatusFilter::All) => "no panes".to_owned(),
+        (None, filter) => format!("nothing {} — Tab to change", filter_label(filter)),
     };
     Line::from(Span::styled(
         truncate(&text, total_width),
@@ -173,16 +176,33 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
         ]);
     }
 
+    // While typing, the prompt owns the footer and shows a cursor; once committed it
+    // shares the line with the filter, because at that point it is just another
+    // thing narrowing the list and you need to see both.
+    if let Some(search) = &app.search {
+        if search.editing {
+            let text = truncate(&format!("/{}", search.query), total_width.saturating_sub(1));
+            let content_width = width(&text);
+            return Line::from(vec![
+                Span::styled(text, Style::default().fg(app.theme.accent)),
+                Span::styled("▏", Style::default().fg(app.theme.accent)),
+                Span::raw(pad_to(content_width + 1, total_width)),
+            ]);
+        }
+    }
+
     let label = filter_label(app.filter).to_owned();
     let hidden = app.hidden_count();
-    let text = if hidden > 0 {
-        format!("{label} · {hidden} hidden")
-    } else {
-        label
+    let mut text = match &app.search {
+        Some(search) => format!("/{}", search.query),
+        None => label,
     };
+    if hidden > 0 {
+        text = format!("{text} · {hidden} hidden");
+    }
     let text = truncate(&text, total_width);
     let content_width = width(&text);
-    let color = if app.filter == StatusFilter::All {
+    let color = if app.filter == StatusFilter::All && app.search.is_none() {
         theme.muted
     } else {
         theme.accent

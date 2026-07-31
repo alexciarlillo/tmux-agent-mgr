@@ -39,6 +39,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::daemon;
 use crate::model::{AgentState, AgentStatus, SessionGroup};
 use crate::nav::{self, Direction};
+use crate::search::Query;
 use crate::tmux;
 use crate::ui::{self, Counts, Surface, rows, rows::RenderedList, theme::Theme};
 
@@ -82,6 +83,31 @@ impl StatusFilter {
     }
 }
 
+/// An open search.
+///
+/// The query outlives the typing: `Enter` closes the prompt but keeps the filter,
+/// so you can search, then navigate the narrowed list with the normal motions.
+/// That is the whole point of committing rather than just filtering while a key is
+/// held. `Esc` is what clears it.
+/// Deliberately not `Default`: the only sensible initial state has `editing:
+/// true`, but a derived default would silently produce `false` — a search that
+/// filters nothing and never accepts a keystroke.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SearchState {
+    pub query: String,
+    /// `true` while the prompt has the keyboard.
+    pub editing: bool,
+}
+
+impl SearchState {
+    fn open() -> Self {
+        Self {
+            query: String::new(),
+            editing: true,
+        }
+    }
+}
+
 pub struct App {
     pub surface: Surface,
     /// Our own pane, excluded from the list and never navigated to. Empty in a
@@ -101,6 +127,8 @@ pub struct App {
     pub numbers: bool,
     /// Digits typed so far, awaiting a motion to consume them.
     pub pending_count: Option<usize>,
+    /// The live search, if one is open. See [`SearchState`].
+    pub search: Option<SearchState>,
     pub spinner: usize,
     pub list: RenderedList,
     pub size: (u16, u16),
@@ -124,6 +152,7 @@ impl App {
             scroll: 0,
             numbers: true,
             pending_count: None,
+            search: None,
             spinner: 0,
             list: RenderedList {
                 lines: Vec::new(),
@@ -160,12 +189,17 @@ impl App {
         ui::list_height(self.size.1) as usize
     }
 
+    /// The active search query, or an empty one when no search is open.
+    pub fn query(&self) -> Query {
+        Query::new(self.search.as_ref().map_or("", |search| &search.query))
+    }
+
     /// Rebuild the rendered list from the current tree and selection.
     ///
     /// Pure and cheap — no I/O — which is what lets the loop call it on every
     /// pass and use its output as the change test.
     fn rebuild(&mut self) {
-        let filtered = filter_sessions(&self.sessions, self.filter);
+        let filtered = filter_sessions(&self.sessions, self.filter, &self.query());
         // Keep the cursor on the same pane across a refresh where possible: rows
         // come and go constantly as agents start and stop, and a selection that
         // jumps under your fingers is worse than one that lags.
@@ -293,6 +327,27 @@ impl App {
         self.selected = nav::step(&self.list.blocks, self.selected, direction, count);
     }
 
+    /// Open the search prompt, keeping any query already typed.
+    fn open_search(&mut self) {
+        self.pending_count = None;
+        match &mut self.search {
+            Some(search) => search.editing = true,
+            None => self.search = Some(SearchState::open()),
+        }
+    }
+
+    /// Close the prompt but keep filtering, so the normal motions now work over the
+    /// narrowed list.
+    fn commit_search(&mut self) {
+        match &mut self.search {
+            // An empty query is not a filter; leaving it "committed" would show a
+            // stale `/` in the footer forever.
+            Some(search) if search.query.is_empty() => self.search = None,
+            Some(search) => search.editing = false,
+            None => {}
+        }
+    }
+
     /// `H` / `L`: jump a whole session.
     fn jump_session(&mut self, direction: Direction) {
         // A count would have to mean "N sessions over", which nobody can aim; drop
@@ -302,10 +357,18 @@ impl App {
     }
 }
 
-/// Drop panes the filter excludes, then drop the windows and sessions that
-/// leaves empty — a session header with nothing under it is just noise.
-fn filter_sessions(sessions: &[SessionGroup], filter: StatusFilter) -> Vec<SessionGroup> {
-    if filter == StatusFilter::All {
+/// Drop panes the status filter or the search excludes, then drop the windows and
+/// sessions that leaves empty — a session header with nothing under it is noise.
+///
+/// The two narrow independently and both must pass, so a search inside a `blocked`
+/// filter means "blocked agents, among these" rather than one silently replacing
+/// the other.
+fn filter_sessions(
+    sessions: &[SessionGroup],
+    filter: StatusFilter,
+    query: &Query,
+) -> Vec<SessionGroup> {
+    if filter == StatusFilter::All && query.is_empty() {
         return sessions.to_vec();
     }
 
@@ -319,7 +382,9 @@ fn filter_sessions(sessions: &[SessionGroup], filter: StatusFilter) -> Vec<Sessi
                     let panes: Vec<_> = window
                         .panes
                         .iter()
-                        .filter(|pane| filter.matches(&pane.status))
+                        .filter(|pane| {
+                            filter.matches(&pane.status) && query.matches(session, window, pane)
+                        })
                         .cloned()
                         .collect();
                     (!panes.is_empty()).then(|| crate::model::WindowInfo {
@@ -350,8 +415,9 @@ fn fingerprint(app: &App) -> u64 {
     app.size.hash(&mut hasher);
     app.filter.hash(&mut hasher);
     app.counts.hash(&mut hasher);
-    // A half-typed count is shown in the footer, so it is part of the screen.
+    // Both are shown in the footer, so they are part of the screen.
     app.pending_count.hash(&mut hasher);
+    app.search.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -547,17 +613,20 @@ mod tests {
             pane("%1", AgentState::Working, true),
             pane("%2", AgentState::Idle, true),
         ]);
-        let working = filter_sessions(&sessions, StatusFilter::Working);
+        let working = filter_sessions(&sessions, StatusFilter::Working, &Query::default());
         assert_eq!(working[0].windows[0].panes.len(), 1);
 
         // Nothing matches: no empty session header left behind.
-        assert!(filter_sessions(&sessions, StatusFilter::Done).is_empty());
+        assert!(filter_sessions(&sessions, StatusFilter::Done, &Query::default()).is_empty());
     }
 
     #[test]
     fn the_all_filter_passes_the_tree_through_untouched() {
         let sessions = tree(vec![pane("%1", AgentState::Idle, true)]);
-        assert_eq!(filter_sessions(&sessions, StatusFilter::All), sessions);
+        assert_eq!(
+            filter_sessions(&sessions, StatusFilter::All, &Query::default()),
+            sessions
+        );
     }
 
     #[test]

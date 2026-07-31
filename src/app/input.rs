@@ -36,6 +36,13 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+    // While the search prompt has the keyboard, letters are text rather than
+    // commands — `j` has to type a `j`, not move the selection.
+    if app.search.as_ref().is_some_and(|search| search.editing) {
+        search_key(key, app, ctrl);
+        return;
+    }
+
     match key.code {
         // Ctrl-C is the one binding that must work regardless of mode.
         KeyCode::Char('c') if ctrl => app.quit = true,
@@ -44,10 +51,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
         KeyCode::Char('d') if ctrl => app.move_selection(page(app)),
         KeyCode::Char('u') if ctrl => app.move_selection(-page(app)),
 
-        // A pending count is a mode you can be stuck in, so Esc has to mean "never
-        // mind" before it means "close" — otherwise a mistyped `12` leaves you
-        // unable to back out without also losing the sidebar.
+        // Esc unwinds state before it closes anything: a pending count and a
+        // committed search are both modes you can be stuck in, and one you can only
+        // leave by also losing the sidebar is a trap.
         KeyCode::Esc if app.pending_count.is_some() => app.pending_count = None,
+        KeyCode::Esc if app.search.is_some() => app.search = None,
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
 
         // Digits accumulate a count; `0` with nothing pending falls through and is
@@ -72,7 +80,41 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => app.activate_selection(),
         KeyCode::Tab => app.filter = app.filter.next(),
+        KeyCode::Char('/') => app.open_search(),
         KeyCode::Char('r') => worker.request_refresh(),
+        _ => {}
+    }
+}
+
+/// Keys while the search prompt is open.
+///
+/// Deliberately minimal: this is a filter box, not a line editor. Ctrl-U to clear
+/// and Ctrl-W to drop a word cover what anyone actually reaches for in a prompt
+/// this short.
+fn search_key(key: KeyEvent, app: &mut App, ctrl: bool) {
+    let Some(search) = app.search.as_mut() else {
+        return;
+    };
+    match key.code {
+        // Abandon the search *and* its filter: leaving the list narrowed by a query
+        // you just cancelled is how panes go missing.
+        KeyCode::Esc => app.search = None,
+        KeyCode::Char('c') if ctrl => app.quit = true,
+        KeyCode::Char('u') if ctrl => search.query.clear(),
+        KeyCode::Char('w') if ctrl => {
+            let trimmed = search.query.trim_end();
+            let cut = trimmed.rfind(char::is_whitespace).map_or(0, |at| at + 1);
+            search.query.truncate(cut);
+        }
+        KeyCode::Enter => app.commit_search(),
+        // Backspacing past the start leaves search entirely, so the prompt cannot
+        // become a mode you are stuck in with nothing typed.
+        KeyCode::Backspace => {
+            if search.query.pop().is_none() {
+                app.search = None;
+            }
+        }
+        KeyCode::Char(ch) if !ctrl => search.query.push(ch),
         _ => {}
     }
 }
@@ -318,6 +360,137 @@ mod tests {
         assert_eq!(app.pending_count, None);
         press(&mut app, &worker, KeyCode::Char('j'));
         assert_eq!(app.selected, 3, "must have moved one, not three");
+    }
+
+    // ─── search ───────────────────────────────────────────────────────
+
+    fn type_str(app: &mut App, worker: &Worker, text: &str) {
+        for ch in text.chars() {
+            press(app, worker, KeyCode::Char(ch));
+        }
+    }
+
+    #[test]
+    fn slash_opens_a_prompt_where_letters_are_text_not_motions() {
+        let (mut app, worker) = fixture(5);
+        press(&mut app, &worker, KeyCode::Char('/'));
+        type_str(&mut app, &worker, "jjk");
+        assert_eq!(app.search.as_ref().unwrap().query, "jjk");
+        assert_eq!(app.selected, 0, "j must type, not move");
+    }
+
+    #[test]
+    fn enter_commits_the_query_and_hands_motions_back() {
+        let (mut app, worker) = multi_session_fixture(&[("work", 2), ("ops", 2)]);
+        press(&mut app, &worker, KeyCode::Char('/'));
+        type_str(&mut app, &worker, "ops");
+        press(&mut app, &worker, KeyCode::Enter);
+
+        let search = app.search.as_ref().unwrap();
+        assert!(!search.editing, "the prompt has closed");
+        assert_eq!(search.query, "ops", "but the filter remains");
+        // The list is narrowed, and j moves again rather than typing.
+        assert_eq!(app.list.blocks.len(), 2);
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn esc_while_typing_abandons_the_search_and_its_filter() {
+        // Leaving the list narrowed by a query you just cancelled is how panes go
+        // missing.
+        let (mut app, worker) = multi_session_fixture(&[("work", 2), ("ops", 2)]);
+        press(&mut app, &worker, KeyCode::Char('/'));
+        type_str(&mut app, &worker, "ops");
+        assert_eq!(app.list.blocks.len(), 2);
+        press(&mut app, &worker, KeyCode::Esc);
+        assert!(app.search.is_none());
+        assert_eq!(app.list.blocks.len(), 4);
+        assert!(!app.quit, "cancelling a search must not close the sidebar");
+    }
+
+    #[test]
+    fn esc_clears_a_committed_search_before_it_closes() {
+        let (mut app, worker) = fixture(3);
+        press(&mut app, &worker, KeyCode::Char('/'));
+        type_str(&mut app, &worker, "work");
+        press(&mut app, &worker, KeyCode::Enter);
+        press(&mut app, &worker, KeyCode::Esc);
+        assert!(app.search.is_none());
+        assert!(!app.quit);
+        press(&mut app, &worker, KeyCode::Esc);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn backspacing_past_the_start_leaves_search_entirely() {
+        // Otherwise an empty prompt is a mode with no visible way out.
+        let (mut app, worker) = fixture(3);
+        press(&mut app, &worker, KeyCode::Char('/'));
+        type_str(&mut app, &worker, "ab");
+        for _ in 0..3 {
+            press(&mut app, &worker, KeyCode::Backspace);
+        }
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn committing_an_empty_query_is_not_a_filter() {
+        let (mut app, worker) = fixture(3);
+        press(&mut app, &worker, KeyCode::Char('/'));
+        press(&mut app, &worker, KeyCode::Enter);
+        assert!(
+            app.search.is_none(),
+            "an empty committed search would show a stale / forever"
+        );
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_query_and_ctrl_w_drops_a_word() {
+        let (mut app, worker) = fixture(3);
+        press(&mut app, &worker, KeyCode::Char('/'));
+        type_str(&mut app, &worker, "claude auth");
+        press_ctrl(&mut app, &worker, 'w');
+        assert_eq!(app.search.as_ref().unwrap().query, "claude ");
+        press_ctrl(&mut app, &worker, 'u');
+        assert_eq!(app.search.as_ref().unwrap().query, "");
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_inside_the_prompt() {
+        let (mut app, worker) = fixture(3);
+        press(&mut app, &worker, KeyCode::Char('/'));
+        press_ctrl(&mut app, &worker, 'c');
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn search_and_the_status_filter_narrow_together() {
+        let (mut app, worker) = multi_session_fixture(&[("work", 2), ("ops", 2)]);
+        // Every fixture pane is Idle+seen, so the Working filter empties the list
+        // regardless of the query — the two must compose, not override.
+        press(&mut app, &worker, KeyCode::Char('/'));
+        type_str(&mut app, &worker, "ops");
+        press(&mut app, &worker, KeyCode::Enter);
+        assert_eq!(app.list.blocks.len(), 2);
+        press(&mut app, &worker, KeyCode::Tab);
+        assert_eq!(app.filter, StatusFilter::Working);
+        assert_eq!(app.list.blocks.len(), 0);
+    }
+
+    #[test]
+    fn a_search_keeps_the_cursor_on_its_pane_when_the_list_narrows() {
+        let (mut app, worker) = multi_session_fixture(&[("work", 2), ("ops", 2)]);
+        app.selected = 2;
+        app.rebuild();
+        let anchored = app.list.blocks[2].target.pane_id.clone();
+
+        press(&mut app, &worker, KeyCode::Char('/'));
+        type_str(&mut app, &worker, "ops");
+        assert_eq!(
+            app.list.blocks[app.selected].target.pane_id, anchored,
+            "the cursor should follow its pane into the narrowed list"
+        );
     }
 
     #[test]
