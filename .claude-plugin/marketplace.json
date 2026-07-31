@@ -1,0 +1,13 @@
+{
+  "name": "alexciarlillo",
+  "owner": {
+    "name": "Alexander Ciarlillo"
+  },
+  "plugins": [
+    {
+      "name": "tmux-agent-mgr",
+      "source": "./",
+      "description": "Push Claude Code session state into the tmux-agent-mgr sidebar"
+    }
+  ]
+}

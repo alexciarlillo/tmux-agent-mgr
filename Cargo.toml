@@ -1,0 +1,28 @@
+[package]
+name = "tmux-agent-mgr"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A tmux sidebar that manages AI coding agents across every session and window, and doubles as a session/window navigator"
+repository = "https://github.com/alexciarlillo/tmux-agent-mgr"
+keywords = ["tmux", "tui", "agents", "claude", "codex"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "agent-mgr"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.29"
+libc = "0.2"
+ratatui = "0.30"
+serde_json = "1"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
