@@ -18,6 +18,7 @@ mod app;
 mod daemon;
 mod detect;
 mod git;
+mod hook;
 mod model;
 mod nav;
 mod pane;
@@ -50,6 +51,7 @@ fn main() {
         Some("resize") => pane::cmd_resize(&rest),
         Some("auto-close") => pane::cmd_auto_close(&rest),
         Some("daemon") => daemon::cmd_daemon(&rest),
+        Some("hook") => hook::cmd_hook(&rest),
         // The two TUI entry points. Same loop, same keymap; the surface decides
         // width, whether a preview is worth its cost, and whether jumping to a
         // pane also closes us.

@@ -1,0 +1,8 @@
+{
+  "name": "tmux-agent-mgr",
+  "version": "0.1.0",
+  "description": "Push Claude Code session state into the tmux-agent-mgr sidebar: permission mode, why a pane is blocked, live subagents, task progress",
+  "repository": "https://github.com/alexciarlillo/tmux-agent-mgr",
+  "license": "MIT",
+  "keywords": ["tmux", "agent", "monitoring", "tui", "sidebar"]
+}
