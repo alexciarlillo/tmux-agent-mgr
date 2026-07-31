@@ -277,21 +277,68 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     ])
 }
 
-/// The preview, dimmed so it reads as a mirror of somewhere else rather than as
-/// content you can interact with here.
+/// The preview, in the colours the mirrored panes were drawn in.
 ///
 /// Padded out to the full height so an empty or short preview overwrites the
 /// previous one instead of leaving its bottom rows on screen — the one place a
 /// stale row would otherwise survive, since we never clear.
 fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let style = Style::default().fg(app.theme.muted);
     let height = list_height(app.size.1) as usize;
     (0..height)
         .map(|row| match app.preview_lines.get(row) {
-            Some(line) => Line::from(Span::styled(line.clone(), style)),
+            Some(line) => Line::from(
+                line.spans
+                    .iter()
+                    .map(|span| {
+                        Span::styled(span.text.clone(), preview_style(span.attrs, &app.theme))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
             None => Line::from(Span::raw(" ".repeat(width as usize))),
         })
         .collect()
+}
+
+/// Map one captured cell's attributes onto a ratatui style.
+///
+/// Text the pane coloured keeps its colour, which is the whole point: recognising
+/// the window at a glance is mostly recognising its palette. Text it *didn't*
+/// colour falls back to the muted tone the entire preview used to be drawn in, so
+/// the mirror still reads as a mirror rather than as content you can interact with —
+/// and a pane that emits no colour at all previews exactly as it did before.
+fn preview_style(attrs: crate::preview::Attrs, theme: &theme::Theme) -> Style {
+    let mut style = Style::default().fg(match attrs.fg {
+        Some(colour) => captured_colour(colour),
+        None => theme.muted,
+    });
+    if let Some(colour) = attrs.bg {
+        style = style.bg(captured_colour(colour));
+    }
+
+    let mut modifiers = Modifier::empty();
+    // Bold is deliberately dropped: at preview scale it adds weight without adding
+    // information, and on terminals that render it as a brighter colour it fights
+    // the muted fallback above.
+    if attrs.dim {
+        modifiers |= Modifier::DIM;
+    }
+    if attrs.italic {
+        modifiers |= Modifier::ITALIC;
+    }
+    if attrs.underline {
+        modifiers |= Modifier::UNDERLINED;
+    }
+    if attrs.reverse {
+        modifiers |= Modifier::REVERSED;
+    }
+    style.add_modifier(modifiers)
+}
+
+fn captured_colour(colour: crate::preview::Colour) -> Color {
+    match colour {
+        crate::preview::Colour::Indexed(index) => Color::Indexed(index),
+        crate::preview::Colour::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+    }
 }
 
 /// A footer prompt: a label, whatever has been typed, and optionally a cursor.

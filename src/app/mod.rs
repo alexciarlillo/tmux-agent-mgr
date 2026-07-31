@@ -157,7 +157,7 @@ pub struct App {
     /// so it is part of the hashed output rather than something `draw` computes —
     /// pane content changing is exactly a reason to redraw, and this is how the loop
     /// notices.
-    pub preview_lines: Vec<String>,
+    pub preview_lines: Vec<crate::preview::Line>,
     pub spinner: usize,
     pub list: RenderedList,
     pub size: (u16, u16),
@@ -1104,7 +1104,7 @@ mod tests {
                 pane_id: "%9".to_owned(),
                 width: 80,
                 height: 24,
-                lines: vec!["stale".to_owned()],
+                lines: vec![captured("stale")],
                 ..Default::default()
             }],
         ));
@@ -1118,12 +1118,17 @@ mod tests {
                 pane_id: "%1".to_owned(),
                 width: 80,
                 height: 24,
-                lines: vec!["fresh".to_owned()],
+                lines: vec![captured("fresh")],
                 ..Default::default()
             }],
         ));
         app.rebuild();
-        assert!(app.preview_lines[0].starts_with("fresh"));
+        assert!(app.preview_lines[0].text().starts_with("fresh"));
+    }
+
+    /// One captured line, as the preview's parser would hand it over.
+    fn captured(text: &str) -> Vec<crate::preview::Cell> {
+        crate::preview::parse_line(text, &mut crate::preview::Attrs::default())
     }
 
     #[test]
