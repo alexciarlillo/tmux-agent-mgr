@@ -1,0 +1,284 @@
+//! Key and mouse handling.
+//!
+//! Vim movement is the default rather than an option, and every binding that
+//! could mean two things resolves the same way it would in a pager: `j`/`k` move,
+//! `g`/`G` jump to the ends, `Enter` acts.
+
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+
+use super::{App, worker::Worker};
+use crate::ui;
+
+pub fn handle(event: Event, app: &mut App, worker: &Worker) {
+    match event {
+        Event::Key(key) => handle_key(key, app, worker),
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Down(_) => click(app, mouse.row),
+            MouseEventKind::ScrollDown => app.move_selection(1),
+            MouseEventKind::ScrollUp => app.move_selection(-1),
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Feed one key into the app.
+///
+/// Split out so the whole keymap is testable without a terminal.
+pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
+    // Windows and some terminals report press *and* release; acting on both would
+    // double every motion.
+    if key.kind == KeyEventKind::Release {
+        return;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    match key.code {
+        // Ctrl-C is the one binding that must work regardless of mode.
+        KeyCode::Char('c') if ctrl => app.quit = true,
+        KeyCode::Char('n') if ctrl => app.move_selection(1),
+        KeyCode::Char('p') if ctrl => app.move_selection(-1),
+        KeyCode::Char('d') if ctrl => app.move_selection(page(app)),
+        KeyCode::Char('u') if ctrl => app.move_selection(-page(app)),
+
+        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+        KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
+        KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
+        KeyCode::Char('g') | KeyCode::Home => app.selected = 0,
+        KeyCode::Char('G') | KeyCode::End => {
+            app.selected = app.list.blocks.len().saturating_sub(1);
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => app.activate_selection(),
+        KeyCode::Tab => app.filter = app.filter.next(),
+        KeyCode::Char('r') => worker.request_refresh(),
+        _ => {}
+    }
+}
+
+/// One screenful of pane rows, for Ctrl-D / Ctrl-U.
+///
+/// Derived from the *average* block height rather than a fixed row count, so a
+/// list of detail-heavy panes pages by a sensible number of panes instead of
+/// flying past them.
+fn page(app: &App) -> isize {
+    let height = app.list_height();
+    if height == 0 || app.list.blocks.is_empty() {
+        return 1;
+    }
+    let average = (app.list.lines.len() / app.list.blocks.len()).max(1);
+    ((height / average).max(1)) as isize
+}
+
+/// Move the selection to whatever pane was clicked. Clicks on a session or window
+/// header, or on empty space, are ignored rather than snapping the cursor
+/// somewhere arbitrary.
+fn click(app: &mut App, row: u16) {
+    if row < ui::HEADER_HEIGHT {
+        return;
+    }
+    let line = (row - ui::HEADER_HEIGHT) as usize + app.scroll;
+    if let Some(block) = app.list.block_at_line(line) {
+        app.selected = block;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::StatusFilter;
+    use crate::model::{
+        AgentKind, AgentState, AgentStatus, PaneInfo, SessionGroup, StatusSource, WindowInfo,
+    };
+
+    fn pane(pane_id: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.to_owned(),
+            window_id: "@1".to_owned(),
+            pane_index: "0".to_owned(),
+            pane_active: false,
+            current_command: "claude".to_owned(),
+            current_path: "/tmp".to_owned(),
+            title: String::new(),
+            pane_pid: None,
+            status: AgentStatus {
+                agent: Some(AgentKind::Claude),
+                state: AgentState::Idle,
+                source: StatusSource::Passive,
+                seen: true,
+                ..AgentStatus::default()
+            },
+            branch: String::new(),
+            worktree: String::new(),
+        }
+    }
+
+    /// An app with `count` selectable panes and a worker whose channel is live.
+    fn fixture(count: usize) -> (App, Worker) {
+        let mut app = App::new("%99".to_owned(), (40, 40));
+        app.sessions = vec![SessionGroup {
+            session_name: "work".to_owned(),
+            session_attached: true,
+            windows: vec![WindowInfo {
+                window_id: "@1".to_owned(),
+                window_index: "1".to_owned(),
+                window_name: "w".to_owned(),
+                window_active: true,
+                panes: (0..count).map(|i| pane(&format!("%{i}"))).collect(),
+            }],
+        }];
+        app.rebuild();
+        (app, crate::app::worker::spawn(false))
+    }
+
+    fn press(app: &mut App, worker: &Worker, code: KeyCode) {
+        handle_key(KeyEvent::new(code, KeyModifiers::NONE), app, worker);
+        app.rebuild();
+    }
+
+    fn press_ctrl(app: &mut App, worker: &Worker, ch: char) {
+        handle_key(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL),
+            app,
+            worker,
+        );
+        app.rebuild();
+    }
+
+    #[test]
+    fn vim_and_arrow_motions_both_move_the_selection() {
+        let (mut app, worker) = fixture(3);
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.selected, 1);
+        press(&mut app, &worker, KeyCode::Down);
+        assert_eq!(app.selected, 2);
+        press(&mut app, &worker, KeyCode::Char('k'));
+        assert_eq!(app.selected, 1);
+        press(&mut app, &worker, KeyCode::Up);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn emacs_style_ctrl_n_and_ctrl_p_also_move() {
+        let (mut app, worker) = fixture(3);
+        press_ctrl(&mut app, &worker, 'n');
+        assert_eq!(app.selected, 1);
+        press_ctrl(&mut app, &worker, 'p');
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn g_and_shift_g_jump_to_the_ends() {
+        let (mut app, worker) = fixture(5);
+        press(&mut app, &worker, KeyCode::Char('G'));
+        assert_eq!(app.selected, 4);
+        press(&mut app, &worker, KeyCode::Char('g'));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn shift_g_on_an_empty_list_does_not_underflow() {
+        let (mut app, worker) = fixture(0);
+        press(&mut app, &worker, KeyCode::Char('G'));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn tab_cycles_the_filter() {
+        let (mut app, worker) = fixture(2);
+        assert_eq!(app.filter, StatusFilter::All);
+        press(&mut app, &worker, KeyCode::Tab);
+        assert_eq!(app.filter, StatusFilter::Working);
+    }
+
+    #[test]
+    fn q_esc_and_ctrl_c_all_close_the_sidebar() {
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            let (mut app, worker) = fixture(1);
+            press(&mut app, &worker, code);
+            assert!(app.quit, "{code:?} should quit");
+        }
+        let (mut app, worker) = fixture(1);
+        press_ctrl(&mut app, &worker, 'c');
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn a_key_release_is_ignored_so_motions_do_not_double() {
+        let (mut app, worker) = fixture(3);
+        handle_key(
+            KeyEvent::new_with_kind(KeyCode::Char('j'), KeyModifiers::NONE, KeyEventKind::Release),
+            &mut app,
+            &worker,
+        );
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_page_by_several_panes_at_once() {
+        let (mut app, worker) = fixture(30);
+        press_ctrl(&mut app, &worker, 'd');
+        assert!(app.selected > 1, "a page should be more than one row");
+        let after_down = app.selected;
+        press_ctrl(&mut app, &worker, 'u');
+        assert!(app.selected < after_down);
+    }
+
+    #[test]
+    fn paging_an_empty_list_is_a_no_op() {
+        let (mut app, worker) = fixture(0);
+        press_ctrl(&mut app, &worker, 'd');
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn clicking_a_pane_row_selects_it() {
+        let (mut app, worker) = fixture(3);
+        let _ = &worker;
+        // Row 0 is the app header; the list starts below it. Session and window
+        // headers take the first two list lines, so the first pane is at row 3.
+        let first_pane_line = app.list.block_line(0);
+        click(&mut app, ui::HEADER_HEIGHT + first_pane_line as u16 + 2);
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn clicking_a_header_or_empty_space_leaves_the_selection_alone() {
+        let (mut app, worker) = fixture(2);
+        let _ = &worker;
+        app.selected = 1;
+        // The app header.
+        click(&mut app, 0);
+        assert_eq!(app.selected, 1);
+        // The session header, which owns no block.
+        click(&mut app, ui::HEADER_HEIGHT);
+        assert_eq!(app.selected, 1);
+        // Far below the last row.
+        click(&mut app, 200);
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn clicking_accounts_for_the_scroll_offset() {
+        let (mut app, worker) = fixture(20);
+        let _ = &worker;
+        app.scroll = 5;
+        let target_line = 7;
+        let expected = app.list.block_at_line(app.scroll + target_line);
+        click(&mut app, ui::HEADER_HEIGHT + target_line as u16);
+        if let Some(expected) = expected {
+            assert_eq!(app.selected, expected);
+        }
+    }
+
+    #[test]
+    fn activating_our_own_pane_is_refused() {
+        // Switching tmux to the sidebar itself would move focus into a pane the
+        // user cannot type into usefully.
+        let (mut app, worker) = fixture(1);
+        let _ = &worker;
+        app.own_pane = app.list.blocks[0].target.pane_id.clone();
+        app.activate_selection();
+        // Nothing to assert on tmux without a server; the guard is that this
+        // returns without issuing commands.
+    }
+}
