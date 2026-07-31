@@ -89,6 +89,7 @@ impl StatusFilter {
 /// so you can search, then navigate the narrowed list with the normal motions.
 /// That is the whole point of committing rather than just filtering while a key is
 /// held. `Esc` is what clears it.
+///
 /// Deliberately not `Default`: the only sensible initial state has `editing:
 /// true`, but a derived default would silently produce `false` — a search that
 /// filters nothing and never accepts a keystroke.
@@ -106,6 +107,22 @@ impl SearchState {
             editing: true,
         }
     }
+}
+
+/// An open window-rename prompt.
+///
+/// Carries the window id it was opened against rather than re-reading the
+/// selection on commit: the worker replaces the tree about once a second, and an
+/// agent starting or stopping can move the cursor while you are still typing.
+/// Resolving the target late would rename whatever happened to be under the cursor
+/// by then.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RenameState {
+    pub window_id: String,
+    /// What the window was called, shown in the prompt so you can see what you are
+    /// replacing.
+    pub original: String,
+    pub name: String,
 }
 
 pub struct App {
@@ -129,6 +146,10 @@ pub struct App {
     pub pending_count: Option<usize>,
     /// The live search, if one is open. See [`SearchState`].
     pub search: Option<SearchState>,
+    /// The window-rename prompt, if one is open.
+    pub rename: Option<RenameState>,
+    /// Showing the keymap instead of the list.
+    pub help: bool,
     pub spinner: usize,
     pub list: RenderedList,
     pub size: (u16, u16),
@@ -153,6 +174,8 @@ impl App {
             numbers: true,
             pending_count: None,
             search: None,
+            rename: None,
+            help: false,
             spinner: 0,
             list: RenderedList {
                 lines: Vec::new(),
@@ -348,6 +371,43 @@ impl App {
         }
     }
 
+    /// Open the rename prompt on the selected pane's window.
+    fn open_rename(&mut self) {
+        self.pending_count = None;
+        let Some(block) = self.list.blocks.get(self.selected) else {
+            return;
+        };
+        let window_id = block.target.window_id.clone();
+        // Seed with the current name so the common case is an edit, not a retype.
+        let original = self
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .find(|window| window.window_id == window_id)
+            .map(|window| window.window_name.clone())
+            .unwrap_or_default();
+        self.rename = Some(RenameState {
+            window_id,
+            name: original.clone(),
+            original,
+        });
+    }
+
+    /// Take the pending rename, if it should be applied.
+    ///
+    /// Pure, so the state machine is testable without running `rename-window`
+    /// against the tmux server hosting the test suite. The caller does the I/O.
+    fn take_rename(&mut self) -> Option<(String, String)> {
+        let state = self.rename.take()?;
+        let name = state.name.trim().to_owned();
+        // An empty name would make tmux fall back to its automatic name, which
+        // looks like the rename silently failed. Unchanged is simply a no-op.
+        if name.is_empty() || name == state.original {
+            return None;
+        }
+        Some((state.window_id, name))
+    }
+
     /// `H` / `L`: jump a whole session.
     fn jump_session(&mut self, direction: Direction) {
         // A count would have to mean "N sessions over", which nobody can aim; drop
@@ -418,6 +478,9 @@ fn fingerprint(app: &App) -> u64 {
     // Both are shown in the footer, so they are part of the screen.
     app.pending_count.hash(&mut hasher);
     app.search.hash(&mut hasher);
+    // The help page replaces the list, and the rename prompt owns the footer.
+    app.help.hash(&mut hasher);
+    app.rename.hash(&mut hasher);
     hasher.finish()
 }
 

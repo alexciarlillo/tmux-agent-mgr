@@ -10,6 +10,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Mou
 
 use super::{App, worker::Worker};
 use crate::nav::{self, Direction};
+use crate::tmux;
 use crate::ui;
 
 pub fn handle(event: Event, app: &mut App, worker: &Worker) {
@@ -36,10 +37,23 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    // While the search prompt has the keyboard, letters are text rather than
-    // commands — `j` has to type a `j`, not move the selection.
+    // While a prompt has the keyboard, letters are text rather than commands — `j`
+    // has to type a `j`, not move the selection.
+    if app.rename.is_some() {
+        rename_key(key, app, worker, ctrl);
+        return;
+    }
     if app.search.as_ref().is_some_and(|search| search.editing) {
         search_key(key, app, ctrl);
+        return;
+    }
+    // Help is a page, not a prompt, but it still swallows keys: any key closing it
+    // means you cannot accidentally act on a list you cannot currently see.
+    if app.help {
+        match key.code {
+            KeyCode::Char('c') if ctrl => app.quit = true,
+            _ => app.help = false,
+        }
         return;
     }
 
@@ -81,7 +95,34 @@ pub fn handle_key(key: KeyEvent, app: &mut App, worker: &Worker) {
         KeyCode::Enter | KeyCode::Char(' ') => app.activate_selection(),
         KeyCode::Tab => app.filter = app.filter.next(),
         KeyCode::Char('/') => app.open_search(),
+        KeyCode::Char('R') => app.open_rename(),
+        KeyCode::Char('?') => app.help = true,
         KeyCode::Char('r') => worker.request_refresh(),
+        _ => {}
+    }
+}
+
+/// Keys while the rename prompt is open.
+fn rename_key(key: KeyEvent, app: &mut App, worker: &Worker, ctrl: bool) {
+    let Some(rename) = app.rename.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => app.rename = None,
+        KeyCode::Char('c') if ctrl => app.quit = true,
+        KeyCode::Char('u') if ctrl => rename.name.clear(),
+        KeyCode::Enter => {
+            if let Some((window_id, name)) = app.take_rename() {
+                tmux::run_tmux_quiet(&["rename-window", "-t", &window_id, &name]);
+                // tmux won't tell us; ask for the new name rather than showing the
+                // old one until the next poll.
+                worker.request_refresh();
+            }
+        }
+        KeyCode::Backspace => {
+            rename.name.pop();
+        }
+        KeyCode::Char(ch) if !ctrl => rename.name.push(ch),
         _ => {}
     }
 }
@@ -491,6 +532,113 @@ mod tests {
             app.list.blocks[app.selected].target.pane_id, anchored,
             "the cursor should follow its pane into the narrowed list"
         );
+    }
+
+    // ─── help ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn question_mark_opens_help_and_any_key_closes_it() {
+        let (mut app, worker) = fixture(3);
+        press(&mut app, &worker, KeyCode::Char('?'));
+        assert!(app.help);
+        press(&mut app, &worker, KeyCode::Char('x'));
+        assert!(!app.help);
+    }
+
+    #[test]
+    fn keys_pressed_over_the_help_page_do_not_also_act() {
+        // The list is not visible, so acting on it would be acting blind.
+        let (mut app, worker) = fixture(5);
+        press(&mut app, &worker, KeyCode::Char('?'));
+        press(&mut app, &worker, KeyCode::Char('j'));
+        assert!(!app.help, "j closed the page");
+        assert_eq!(app.selected, 0, "and did not also move");
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_the_help_page() {
+        let (mut app, worker) = fixture(3);
+        press(&mut app, &worker, KeyCode::Char('?'));
+        press_ctrl(&mut app, &worker, 'c');
+        assert!(app.quit);
+    }
+
+    // ─── rename ───────────────────────────────────────────────────────
+
+    #[test]
+    fn rename_opens_seeded_with_the_current_window_name() {
+        // Renaming is usually an edit, not a retype.
+        let (mut app, worker) = fixture(2);
+        press(&mut app, &worker, KeyCode::Char('R'));
+        let rename = app.rename.as_ref().unwrap();
+        assert_eq!(rename.name, "w");
+        assert_eq!(rename.original, "w");
+        assert_eq!(rename.window_id, "@0");
+    }
+
+    #[test]
+    fn rename_captures_its_target_when_opened_not_when_committed() {
+        // The worker replaces the tree about once a second; resolving the target on
+        // commit would rename whatever the cursor had drifted onto.
+        let (mut app, worker) = multi_session_fixture(&[("work", 1), ("ops", 1)]);
+        press(&mut app, &worker, KeyCode::Char('R'));
+        assert_eq!(app.rename.as_ref().unwrap().window_id, "@0");
+
+        app.selected = 1;
+        app.rebuild();
+        press(&mut app, &worker, KeyCode::Char('x'));
+        assert_eq!(
+            app.rename.as_ref().unwrap().window_id, "@0",
+            "the target must not follow the cursor"
+        );
+    }
+
+    #[test]
+    fn typing_in_the_rename_prompt_does_not_move_the_selection() {
+        let (mut app, worker) = fixture(5);
+        press(&mut app, &worker, KeyCode::Char('R'));
+        press_ctrl(&mut app, &worker, 'u');
+        type_str(&mut app, &worker, "jjkk");
+        assert_eq!(app.rename.as_ref().unwrap().name, "jjkk");
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn esc_abandons_a_rename() {
+        let (mut app, worker) = fixture(2);
+        press(&mut app, &worker, KeyCode::Char('R'));
+        type_str(&mut app, &worker, "zzz");
+        press(&mut app, &worker, KeyCode::Esc);
+        assert!(app.rename.is_none());
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn an_unchanged_or_blank_rename_is_a_no_op() {
+        // tmux treats an empty name as "go back to automatic naming", which reads as
+        // the rename having silently failed.
+        let (mut app, _worker) = fixture(2);
+        app.open_rename();
+        assert_eq!(app.take_rename(), None, "unchanged name");
+
+        app.open_rename();
+        app.rename.as_mut().unwrap().name = "   ".to_owned();
+        assert_eq!(app.take_rename(), None, "blank name");
+
+        app.open_rename();
+        app.rename.as_mut().unwrap().name = " built ".to_owned();
+        assert_eq!(
+            app.take_rename(),
+            Some(("@0".to_owned(), "built".to_owned())),
+            "a real change is trimmed and applied"
+        );
+    }
+
+    #[test]
+    fn rename_on_an_empty_list_opens_nothing() {
+        let (mut app, worker) = fixture(0);
+        press(&mut app, &worker, KeyCode::Char('R'));
+        assert!(app.rename.is_none());
     }
 
     #[test]

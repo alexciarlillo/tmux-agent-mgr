@@ -1,12 +1,13 @@
 //! Drawing the sidebar: a header, the scrollable list, and a footer.
 
+pub mod help;
 pub mod rows;
 pub mod text;
 pub mod theme;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -66,7 +67,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
             height: list_rows,
             ..area
         };
-        if app.list.is_empty() {
+        if app.help {
+            let page = help::lines(area.width as usize, list_rows as usize, &app.theme);
+            frame.render_widget(Paragraph::new(page), list);
+        } else if app.list.is_empty() {
             frame.render_widget(Paragraph::new(empty_state(app, area.width as usize)), list);
         } else {
             let visible: Vec<Line<'static>> = app
@@ -159,6 +163,14 @@ fn filter_label(filter: StatusFilter) -> &'static str {
 /// A filter you forgot you set is the classic "why is my agent missing" bug.
 fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     let theme = &app.theme;
+    if app.help {
+        return prompt_line("any key to close", "", total_width, theme.muted, false);
+    }
+    // A rename is destructive-ish and mode-y, so it takes the footer outright and
+    // says what it is renaming rather than showing a bare text box.
+    if let Some(rename) = &app.rename {
+        return prompt_line("rename: ", &rename.name, total_width, theme.accent, true);
+    }
     // A half-typed count has to be visible: without an echo you cannot tell a
     // pending `1` from a keystroke that was dropped, and you find out only by
     // pressing `j` and going somewhere unexpected.
@@ -179,16 +191,10 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     // While typing, the prompt owns the footer and shows a cursor; once committed it
     // shares the line with the filter, because at that point it is just another
     // thing narrowing the list and you need to see both.
-    if let Some(search) = &app.search {
-        if search.editing {
-            let text = truncate(&format!("/{}", search.query), total_width.saturating_sub(1));
-            let content_width = width(&text);
-            return Line::from(vec![
-                Span::styled(text, Style::default().fg(app.theme.accent)),
-                Span::styled("▏", Style::default().fg(app.theme.accent)),
-                Span::raw(pad_to(content_width + 1, total_width)),
-            ]);
-        }
+    if let Some(search) = &app.search
+        && search.editing
+    {
+        return prompt_line("/", &search.query, total_width, theme.accent, true);
     }
 
     let label = filter_label(app.filter).to_owned();
@@ -211,6 +217,32 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
         Span::styled(text, Style::default().fg(color)),
         Span::raw(pad_to(content_width, total_width)),
     ])
+}
+
+/// A footer prompt: a label, whatever has been typed, and optionally a cursor.
+///
+/// The cursor is a real cell reserved out of the width rather than a terminal
+/// cursor, because the pane's actual cursor is wherever ratatui last left it and
+/// moving it would be one more thing to keep in sync on every draw.
+fn prompt_line(
+    label: &str,
+    text: &str,
+    total_width: usize,
+    color: Color,
+    cursor: bool,
+) -> Line<'static> {
+    let cursor_width = usize::from(cursor);
+    let body = truncate(
+        &format!("{label}{text}"),
+        total_width.saturating_sub(cursor_width),
+    );
+    let content_width = width(&body) + cursor_width;
+    let mut spans = vec![Span::styled(body, Style::default().fg(color))];
+    if cursor {
+        spans.push(Span::styled("▏", Style::default().fg(color)));
+    }
+    spans.push(Span::raw(pad_to(content_width, total_width)));
+    Line::from(spans)
 }
 
 /// Per-state tallies for the header.
