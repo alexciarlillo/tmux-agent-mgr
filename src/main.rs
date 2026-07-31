@@ -21,6 +21,7 @@ mod git;
 mod model;
 mod nav;
 mod pane;
+mod preview;
 mod search;
 mod tmux;
 mod ui;

@@ -39,6 +39,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::daemon;
 use crate::model::{AgentState, AgentStatus, SessionGroup};
 use crate::nav::{self, Direction};
+use crate::preview::PanePreview;
 use crate::search::Query;
 use crate::tmux;
 use crate::ui::{self, Counts, Surface, rows, rows::RenderedList, theme::Theme};
@@ -150,6 +151,13 @@ pub struct App {
     pub rename: Option<RenameState>,
     /// Showing the keymap instead of the list.
     pub help: bool,
+    /// Latest captured panes for the previewed window, as `(window_id, panes)`.
+    pub preview: Option<(String, Vec<PanePreview>)>,
+    /// The preview composed for the current geometry. Derived in [`Self::rebuild`]
+    /// so it is part of the hashed output rather than something `draw` computes —
+    /// pane content changing is exactly a reason to redraw, and this is how the loop
+    /// notices.
+    pub preview_lines: Vec<String>,
     pub spinner: usize,
     pub list: RenderedList,
     pub size: (u16, u16),
@@ -176,6 +184,8 @@ impl App {
             search: None,
             rename: None,
             help: false,
+            preview: None,
+            preview_lines: Vec::new(),
             spinner: 0,
             list: RenderedList {
                 lines: Vec::new(),
@@ -260,6 +270,35 @@ impl App {
         self.clamp_selection();
         self.clamp_scroll();
         self.counts = Counts::tally(&self.sessions);
+        self.compose_preview();
+    }
+
+    /// The window the preview should be showing, if this surface has one.
+    pub fn preview_window(&self) -> Option<&str> {
+        if !self.surface.shows_preview() || self.help {
+            return None;
+        }
+        Some(&self.list.blocks.get(self.selected)?.target.window_id)
+    }
+
+    /// Re-compose the preview for the current geometry.
+    ///
+    /// Drops a capture belonging to a window we have since moved off: drawing it
+    /// beside a different row would assert something false about the selection, and
+    /// a blank preview for one frame is the honest alternative.
+    fn compose_preview(&mut self) {
+        let area = ui::preview_area(self.surface, self.size);
+        let Some(area) = area else {
+            self.preview_lines.clear();
+            return;
+        };
+        let wanted = self.preview_window().map(str::to_owned);
+        self.preview_lines = match (&self.preview, wanted) {
+            (Some((window_id, panes)), Some(wanted)) if *window_id == wanted => {
+                crate::preview::compose(panes, area)
+            }
+            _ => Vec::new(),
+        };
     }
 
     fn clamp_selection(&mut self) {
@@ -481,6 +520,9 @@ fn fingerprint(app: &App) -> u64 {
     // The help page replaces the list, and the rename prompt owns the footer.
     app.help.hash(&mut hasher);
     app.rename.hash(&mut hasher);
+    // Pane content changing behind the preview is a real reason to redraw, and
+    // hashing the composed lines is how the loop learns about it.
+    app.preview_lines.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -505,8 +547,14 @@ pub fn run(
     while !app.quit {
         // 1. Newest snapshot wins; drain so a burst can't build a backlog.
         let mut received = false;
-        while let Ok(sessions) = worker.rx.try_recv() {
-            app.sessions = sessions;
+        while let Ok(snapshot) = worker.rx.try_recv() {
+            app.sessions = snapshot.sessions;
+            // Keep the previous capture when this pass carried none: the target is
+            // set after the first rebuild, so the very first snapshot has no preview
+            // and clearing here would blank it once per interval.
+            if let Some(preview) = snapshot.preview {
+                app.preview = Some(preview);
+            }
             received = true;
         }
 
@@ -525,6 +573,9 @@ pub fn run(
 
         // 4. Rebuild (pure) and draw only if the output moved.
         app.rebuild();
+        // Tell the worker what to capture next. After rebuild, because the selection
+        // may have been clamped or re-anchored onto a different window.
+        worker.set_preview_target(app.preview_window());
         let current = fingerprint(&app);
         if last_fingerprint != Some(current) {
             terminal.draw(|frame| ui::draw(frame, &app))?;
@@ -904,6 +955,75 @@ mod tests {
         // The sidebar's whole value is that you keep jumping around with it open.
         assert!(Surface::Popup.dismisses_on_activate());
         assert!(!Surface::Sidebar.dismisses_on_activate());
+    }
+
+    // ─── preview gating ───────────────────────────────────────────────
+
+    #[test]
+    fn a_sidebar_never_asks_for_a_preview() {
+        // Which is what keeps a capture-pane per pane off a panel open all day.
+        let app = app_with(vec![pane("%1", AgentState::Idle, true)], 40);
+        assert_eq!(app.preview_window(), None);
+    }
+
+    #[test]
+    fn a_popup_previews_the_selected_panes_window() {
+        let mut app = surfaced_app(Surface::Popup, vec![pane("%1", AgentState::Idle, true)], 40);
+        app.size = (200, 50);
+        app.rebuild();
+        assert_eq!(app.preview_window(), Some("@1"));
+    }
+
+    #[test]
+    fn the_help_page_suspends_the_preview() {
+        // Nothing of it is on screen, so capturing for it is pure waste.
+        let mut app = surfaced_app(Surface::Popup, vec![pane("%1", AgentState::Idle, true)], 40);
+        app.size = (200, 50);
+        app.help = true;
+        app.rebuild();
+        assert_eq!(app.preview_window(), None);
+    }
+
+    #[test]
+    fn a_capture_for_a_window_we_have_moved_off_is_not_drawn() {
+        // Drawing it beside a different row would assert something false about the
+        // selection; one blank frame is the honest alternative.
+        let mut app = surfaced_app(Surface::Popup, vec![pane("%1", AgentState::Idle, true)], 40);
+        app.size = (200, 50);
+        app.preview = Some((
+            "@somewhere-else".to_owned(),
+            vec![crate::preview::PanePreview {
+                pane_id: "%9".to_owned(),
+                width: 80,
+                height: 24,
+                lines: vec!["stale".to_owned()],
+                ..Default::default()
+            }],
+        ));
+        app.rebuild();
+        assert!(app.preview_lines.is_empty());
+
+        // The matching window is composed.
+        app.preview = Some((
+            "@1".to_owned(),
+            vec![crate::preview::PanePreview {
+                pane_id: "%1".to_owned(),
+                width: 80,
+                height: 24,
+                lines: vec!["fresh".to_owned()],
+                ..Default::default()
+            }],
+        ));
+        app.rebuild();
+        assert!(app.preview_lines[0].starts_with("fresh"));
+    }
+
+    #[test]
+    fn a_popup_too_narrow_for_a_preview_composes_none() {
+        let mut app = surfaced_app(Surface::Popup, vec![pane("%1", AgentState::Idle, true)], 40);
+        app.size = (40, 50);
+        app.rebuild();
+        assert!(app.preview_lines.is_empty());
     }
 
     #[test]

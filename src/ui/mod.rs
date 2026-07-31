@@ -39,6 +39,49 @@ impl Surface {
     pub fn dismisses_on_activate(self) -> bool {
         self == Self::Popup
     }
+
+    /// Whether this surface can afford a live window preview.
+    ///
+    /// Preview costs a `capture-pane` subprocess per pane per refresh, which is
+    /// fine for the seconds a popup is up and not fine for a pane open all day. It
+    /// also needs columns a 24-wide sidebar does not have.
+    pub fn shows_preview(self) -> bool {
+        self == Self::Popup
+    }
+}
+
+/// Columns given to the list when a preview shares the width.
+///
+/// The list is the thing you are navigating, so it gets a stable, generous column
+/// rather than a proportion — a list that reflows as the preview changes shape is
+/// much harder to aim a counted motion at. The preview takes the rest.
+const LIST_WIDTH: u16 = 44;
+/// Below this the preview is too narrow to recognise anything in, so the list keeps
+/// the whole width instead. A 12-column preview is decoration, not information.
+const MIN_PREVIEW_WIDTH: u16 = 24;
+
+/// Split a popup's width into (list, preview). `None` when there is no room.
+pub fn split_width(surface: Surface, total_width: u16) -> (u16, Option<u16>) {
+    if !surface.shows_preview() || total_width < LIST_WIDTH + MIN_PREVIEW_WIDTH {
+        return (total_width, None);
+    }
+    (LIST_WIDTH, Some(total_width - LIST_WIDTH))
+}
+
+/// The rectangle the preview occupies, in preview-local coordinates.
+///
+/// Returns `None` when this surface or this geometry has no preview, which is what
+/// [`crate::app::App::compose_preview`] uses to skip the work entirely.
+pub fn preview_area(surface: Surface, size: (u16, u16)) -> Option<crate::preview::Rect> {
+    let (_, preview_width) = split_width(surface, size.0);
+    let width = preview_width? as usize;
+    let height = list_height(size.1) as usize;
+    (width > 0 && height > 0).then_some(crate::preview::Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    })
 }
 
 /// Lines reserved at the top and bottom of the pane. Both are fixed so the list
@@ -60,18 +103,33 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let header = Rect { height: HEADER_HEIGHT.min(area.height), ..area };
     frame.render_widget(Paragraph::new(header_line(app, area.width as usize)), header);
 
+    let (list_width, preview_width) = split_width(app.surface, area.width);
     let list_rows = list_height(area.height);
+
+    if let Some(preview_width) = preview_width
+        && list_rows > 0
+    {
+        let pane = Rect {
+            x: area.x + list_width,
+            y: area.y + HEADER_HEIGHT,
+            width: preview_width,
+            height: list_rows,
+        };
+        frame.render_widget(Paragraph::new(preview_lines(app, preview_width)), pane);
+    }
+
     if list_rows > 0 {
         let list = Rect {
             y: area.y + HEADER_HEIGHT,
+            width: list_width,
             height: list_rows,
             ..area
         };
         if app.help {
-            let page = help::lines(area.width as usize, list_rows as usize, &app.theme);
+            let page = help::lines(list_width as usize, list_rows as usize, &app.theme);
             frame.render_widget(Paragraph::new(page), list);
         } else if app.list.is_empty() {
-            frame.render_widget(Paragraph::new(empty_state(app, area.width as usize)), list);
+            frame.render_widget(Paragraph::new(empty_state(app, list_width as usize)), list);
         } else {
             let visible: Vec<Line<'static>> = app
                 .list
@@ -219,6 +277,23 @@ fn footer_line(app: &App, total_width: usize) -> Line<'static> {
     ])
 }
 
+/// The preview, dimmed so it reads as a mirror of somewhere else rather than as
+/// content you can interact with here.
+///
+/// Padded out to the full height so an empty or short preview overwrites the
+/// previous one instead of leaving its bottom rows on screen — the one place a
+/// stale row would otherwise survive, since we never clear.
+fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let style = Style::default().fg(app.theme.muted);
+    let height = list_height(app.size.1) as usize;
+    (0..height)
+        .map(|row| match app.preview_lines.get(row) {
+            Some(line) => Line::from(Span::styled(line.clone(), style)),
+            None => Line::from(Span::raw(" ".repeat(width as usize))),
+        })
+        .collect()
+}
+
 /// A footer prompt: a label, whatever has been typed, and optionally a cursor.
 ///
 /// The cursor is a real cell reserved out of the width rather than a terminal
@@ -321,6 +396,51 @@ mod tests {
                 panes,
             }],
         }]
+    }
+
+    // ─── popup layout ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_sidebar_never_gives_width_to_a_preview() {
+        // However wide the pane gets, a sidebar has no preview to put there.
+        for width in [24, 80, 200] {
+            assert_eq!(split_width(Surface::Sidebar, width), (width, None));
+        }
+    }
+
+    #[test]
+    fn a_wide_popup_splits_into_list_and_preview() {
+        let (list, preview) = split_width(Surface::Popup, 200);
+        assert_eq!(list, LIST_WIDTH);
+        assert_eq!(preview, Some(200 - LIST_WIDTH));
+    }
+
+    #[test]
+    fn a_narrow_popup_keeps_the_whole_width_for_the_list() {
+        // A 12-column preview is decoration; the list is the thing being navigated,
+        // so it takes the space rather than both being unusable.
+        let (list, preview) = split_width(Surface::Popup, LIST_WIDTH + MIN_PREVIEW_WIDTH - 1);
+        assert_eq!(list, LIST_WIDTH + MIN_PREVIEW_WIDTH - 1);
+        assert_eq!(preview, None);
+    }
+
+    #[test]
+    fn the_split_never_exceeds_the_width_it_was_given() {
+        for width in 0..=240u16 {
+            let (list, preview) = split_width(Surface::Popup, width);
+            assert_eq!(list + preview.unwrap_or(0), width, "at width {width}");
+        }
+    }
+
+    #[test]
+    fn preview_area_is_absent_without_room_or_without_a_preview_surface() {
+        assert!(preview_area(Surface::Sidebar, (200, 50)).is_none());
+        assert!(preview_area(Surface::Popup, (40, 50)).is_none(), "too narrow");
+        // Height 2 is entirely header plus footer.
+        assert!(preview_area(Surface::Popup, (200, 2)).is_none(), "no rows");
+        let area = preview_area(Surface::Popup, (200, 50)).unwrap();
+        assert_eq!(area.width, (200 - LIST_WIDTH) as usize);
+        assert_eq!(area.height, list_height(50) as usize);
     }
 
     #[test]
