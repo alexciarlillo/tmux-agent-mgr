@@ -15,6 +15,8 @@ Two things it tries to get right:
 
 It works with **zero setup**: agents are detected from the process table and the
 pane's visible screen, so nothing needs installing into Claude Code or Codex.
+Installing the [Claude Code hooks](#optional-claude-code-hooks) is what upgrades
+those inferences into things the agent tells you outright.
 
 ## Install
 
@@ -36,6 +38,29 @@ tmux source ~/.tmux.conf
 Requires tmux 3.0+. The popup needs 3.3+ (`display-popup -B -E`); below that
 everything else still works and the popup key is simply not bound.
 
+### Optional: Claude Code hooks
+
+Passive detection can only ever see *working / blocked / idle*. Claude Code's hooks
+report the rest — permission mode, why a pane is blocked, live subagents, task
+progress — and they turn "blocked, I think" into "blocked, it said so". Register
+this repo as a Claude Code plugin:
+
+```
+/plugin marketplace add ~/.tmux/plugins/tmux-agent-mgr
+/plugin install tmux-agent-mgr@alexciarlillo
+```
+
+Restart the agent and its row gains the extra lines. Nothing else changes: hooks
+apply per pane, panes without them keep using passive detection, and the sidebar
+marks which source it is reading. If you would rather wire it by hand, point your
+`~/.claude/settings.json` hooks at `hook.sh` — see `hooks/hooks.json` for the
+trigger names and the argument each one passes.
+
+Hooks are strictly additive and never load-bearing: `hook.sh` exits 0 when the
+binary is missing or you aren't in tmux, and the daemon clears a pane's hook state
+the moment no agent process remains under it — so a `kill -9`'d agent can't leave a
+pane latched to "running".
+
 ## Use
 
 | Key | |
@@ -47,6 +72,10 @@ everything else still works and the popup key is simply not bound.
 The **sidebar** is narrow and persistent. The **popup** is the same list
 full-screen with a live preview of the selected window beside it, and it closes
 itself as soon as you jump somewhere — it's a chooser, not a place to live.
+
+The preview mirrors the window's layout *and* its colours, because recognising a
+window at a glance is mostly recognising its palette. Text the pane didn't colour is
+drawn muted, so the mirror still reads as a mirror.
 
 ### Inside the list
 
@@ -78,20 +107,21 @@ it composes with the status filter rather than replacing it.
 ### Reading a row
 
 ```
- ● claude  plan               1m12s
+ ◉ claude  plan               1m12s
    feat/auth ~wt-auth
-   ▸ waiting: permission
-   ▸ Explore ×2
-   ▸ tasks 3/7
+   ▸ permission prompt
+   ▸ Explore ×2, Plan
+   ▸ tasks 1/3
 ```
 
 `●` working · `◉` blocked, needs you · `●` finished and unread · `○` idle ·
 `✕` errored · `·` no agent. A `┃` marks the pane tmux is actually focused on.
 
 The lines below the first appear only when there is something to say. The branch
-row comes from git; the rest need agent hooks (not yet shipped — see Status). A
-trailing `?` on the agent name means the *blocked* reading came from a heuristic
-rather than from the agent itself.
+row comes from git; the permission badge, wait reason, subagents and task progress
+come from [agent hooks](#optional-claude-code-hooks). A trailing `?` on the agent
+name means the *blocked* reading came from a heuristic rather than from the agent
+itself.
 
 Window tabs also carry a rolled-up status glyph, appended to your existing
 `window-status-format` without replacing it.
@@ -141,15 +171,26 @@ which is why it feels immediate while drawing almost never.
 
 No tmux or git subprocess ever runs on the UI thread.
 
+Status comes from two sources kept in separate pane-option namespaces. Hooks write
+raw facts; the daemon reconciles them with passive detection and is the only writer
+of the resolved status. Hook state wins for a pane while it is fresh and an agent
+process is still alive there, and the daemon owns liveness for both — which is what
+lets a hook write be trusted without it ever getting stuck.
+
+Subagents inherit their parent's `$TMUX_PANE`, so while any subagent is live we
+can't tell a parent's event from a child's. The ingest then accepts only the
+assertions that hold either way: "work is happening" and "somebody needs you" pass
+through, while "the turn is over" waits for the subagent list to drain.
+
 ## Status
 
-Working: passive detection (Claude Code and Codex), the sidebar, the popup with
-window preview, navigation, search, filters, rename, session reorder, tab glyphs.
+Working: passive detection (Claude Code and Codex), Claude Code hooks, the sidebar,
+the popup with window preview, navigation, search, filters, rename, session reorder,
+tab glyphs.
 
-Not yet: **agent hooks**, which is what will populate the permission badge, wait
-reason, subagent and task-progress rows — the model and rendering for them are in
-place and simply have nothing feeding them yet. The preview is also plain text; it
-doesn't carry ANSI colour through.
+Not yet: the `▸ bg` row has no writer — a backgrounded shell command is only visible
+through `PostToolUse`, which fires on every tool call and is deliberately not
+registered.
 
 ## Development
 
@@ -177,6 +218,18 @@ tmux -L probe kill-server          # only ever with -L
 `-f /dev/null` so you aren't looking at your own config, and `-L` on *every* call —
 a bare `tmux` resolves through `$TMUX` to your real server. Run the plugin's own
 commands inside the probe server for the same reason.
+
+A hook can be fired by hand without an agent: it reads its payload from stdin and
+attributes it to `$TMUX_PANE`, exactly as it inherits both from Claude Code.
+
+```sh
+echo '{"notification_type":"permission_prompt"}' \
+  | TMUX_PANE=%3 sh hook.sh claude notification
+```
+
+Note that the daemon clears hook state on a pane with no agent process under it, so
+to watch a hook survive a poll the pane needs a process with an agent-shaped name —
+`ln -s "$(command -v sleep)" /tmp/fakebin/claude` is enough.
 
 `AGENT_MGR_DEBUG_FRAMES=/tmp/frames` makes the binary write its draw count on exit,
 so the no-flicker claim is something you can check rather than take on faith.
