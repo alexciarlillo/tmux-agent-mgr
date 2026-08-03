@@ -52,8 +52,12 @@ mod field {
     pub const TASK_TOTAL: usize = 27;
     pub const BG_CMD: usize = 28;
     pub const CWD: usize = 29;
+    /// When a client last attached to this session. Appended rather than filed
+    /// beside [`SESSION_ATTACHED`] so adding it renumbered nothing; read only to
+    /// break a tie between two attached sessions, in `client_session`.
+    pub const SESSION_LAST_ATTACHED: usize = 30;
     /// Number of fields a well-formed line must have.
-    pub const COUNT: usize = 30;
+    pub const COUNT: usize = 31;
 }
 
 const DELIMITER: char = '|';
@@ -90,6 +94,7 @@ fn format_fields() -> Vec<String> {
         q(PANE_TASK_TOTAL),
         q(PANE_BG_CMD),
         q(PANE_CWD),
+        q("session_last_attached"),
     ]
 }
 
@@ -127,6 +132,10 @@ impl HookFacts {
 pub struct PaneRow {
     pub session_name: String,
     pub session_attached: bool,
+    /// `#{session_last_attached}`: when a client last switched to this session. A
+    /// session no client has ever attached to reports an empty string, which reads
+    /// as 0 — older than any real timestamp, which is the right answer for it.
+    pub session_last_attached: u64,
     pub window_id: String,
     pub window_index: String,
     pub window_name: String,
@@ -211,6 +220,7 @@ fn parse_pane_row(line: &str) -> Option<PaneRow> {
     Some(PaneRow {
         session_name: f[field::SESSION_NAME].clone(),
         session_attached: f[field::SESSION_ATTACHED] != "0",
+        session_last_attached: f[field::SESSION_LAST_ATTACHED].parse().unwrap_or(0),
         window_id: f[field::WINDOW_ID].clone(),
         window_index: f[field::WINDOW_INDEX].clone(),
         window_name: f[field::WINDOW_NAME].clone(),
@@ -261,31 +271,38 @@ fn task_progress(done: Option<u32>, total: Option<u32>) -> Option<TaskProgress> 
     })
 }
 
-/// The pane tmux focus is on, seen from the sidebar living in `own_pane`.
+/// The pane the client is on, seen from the surface living in `own_pane`.
 ///
 /// This is what lets the cursor follow the plugin's own `C-h/j/k/l` bindings instead
 /// of being left behind by them: the list and the terminal disagreeing about "here"
 /// is how you end up acting on the wrong pane.
 ///
-/// Resolved against *our own session* rather than "whichever session is attached",
-/// because several can be, and only ours tells us which window and pane this sidebar
-/// is looking at. Following the session's active window — not just our own window —
-/// means the sidebar you come back to has tracked where you went.
+/// Resolved against wherever the *client* currently is — see [`client_session`] —
+/// rather than against our own session, which left every sidebar outside the session
+/// you were in pointing at a pane you had walked away from. Following the session's
+/// active window, not just our own window, is the same idea one level down.
 ///
 /// A sidebar holding focus is not a jump target (it is furniture, and it is excluded
 /// from the list anyway), so we fall back to the window's last pane: the one you came
 /// from, which is exactly where the cursor should sit when you land in the sidebar.
+/// That fallback is also what keeps a click in the sidebar from being undone — tmux
+/// makes the clicked pane active *and* forwards the click, so without it every click
+/// would drag the cursor back out.
 ///
-/// `None` when we cannot say — no `own_pane` (a popup, which is not a pane in any
-/// window), our pane already gone, or nothing but sidebars in the active window.
+/// `None` when we cannot say: our own pane is already gone (the next poll will tell us
+/// to stop), or there is nothing but sidebars in the window in focus. An empty
+/// `own_pane` is a popup — no session of its own, so it simply follows the client.
 pub fn focused_pane(rows: &[PaneRow], own_pane: &str) -> Option<String> {
-    if own_pane.is_empty() {
-        return None;
-    }
-    let session = rows
-        .iter()
-        .find(|row| row.pane.pane_id == own_pane)
-        .map(|row| row.session_name.as_str())?;
+    let own_session = if own_pane.is_empty() {
+        None
+    } else {
+        Some(
+            rows.iter()
+                .find(|row| row.pane.pane_id == own_pane)
+                .map(|row| row.session_name.as_str())?,
+        )
+    };
+    let session = client_session(rows, own_session)?;
 
     let in_focus = |row: &&PaneRow| {
         row.session_name == session && row.window_active && !row.is_sidebar()
@@ -294,6 +311,32 @@ pub fn focused_pane(rows: &[PaneRow], own_pane: &str) -> Option<String> {
         .find(|row| in_focus(row) && row.pane.pane_active)
         .or_else(|| rows.iter().find(|row| in_focus(row) && row.pane_last))
         .map(|row| row.pane.pane_id.clone())
+}
+
+/// Which session the client is looking at, given the session we live in ourselves.
+///
+/// Our own session wins while it is attached, so two clients sitting in two sessions
+/// each keep their own sidebars: without that preference both would chase whichever
+/// client moved last. Otherwise the client has walked off somewhere else and we
+/// follow it, most-recently-attached first — a `switch-client` bumps
+/// `session_last_attached`, so that is the session it just arrived in.
+///
+/// With nothing attached at all — a detached server whose sidebars are still
+/// polling — there is no client to follow, and we fall back to our own session
+/// rather than dropping the cursor.
+fn client_session<'a>(rows: &'a [PaneRow], own: Option<&'a str>) -> Option<&'a str> {
+    let attached =
+        |name: &str| rows.iter().any(|row| row.session_name == name && row.session_attached);
+    if let Some(own) = own
+        && attached(own)
+    {
+        return Some(own);
+    }
+    rows.iter()
+        .filter(|row| row.session_attached)
+        .max_by_key(|row| row.session_last_attached)
+        .map(|row| row.session_name.as_str())
+        .or(own)
 }
 
 /// Group flat pane rows into the session → window → pane tree the sidebar draws.
@@ -468,6 +511,10 @@ mod tests {
         assert_eq!(fields[field::STATE], q(PANE_STATE));
         assert_eq!(fields[field::HOOK_STATE], q(PANE_HOOK_STATE));
         assert_eq!(fields[field::CWD], q(PANE_CWD));
+        assert_eq!(
+            fields[field::SESSION_LAST_ATTACHED],
+            q("session_last_attached")
+        );
     }
 
     #[test]
@@ -644,8 +691,8 @@ mod tests {
 
     #[test]
     fn focus_is_the_active_pane_of_our_own_session() {
-        // Our own session is the disambiguator: several can be attached at once, and
-        // only ours says which window and pane this sidebar is beside.
+        // While our own session is attached, it is the one we resolve against:
+        // several can be, and another client's "here" is not ours to follow.
         let output = [
             line(&[(field::PANE_ID, "%0"), (field::ROLE, PANE_ROLE_SIDEBAR)]),
             line(&[(field::PANE_ID, "%1"), (field::PANE_ACTIVE, "0")]),
@@ -704,12 +751,142 @@ mod tests {
     }
 
     #[test]
+    fn focus_follows_the_client_out_of_our_own_session() {
+        // The bug this fixes: switch the client to another session and the sidebar in
+        // the one you left kept pointing at a pane you had walked away from, while
+        // tmux's own `┃` marker moved. Two markers, two different answers.
+        let output = [
+            line(&[
+                (field::PANE_ID, "%0"),
+                (field::ROLE, PANE_ROLE_SIDEBAR),
+                (field::SESSION_ATTACHED, "0"),
+            ]),
+            line(&[(field::PANE_ID, "%1"), (field::SESSION_ATTACHED, "0")]),
+            line(&[
+                (field::PANE_ID, "%9"),
+                (field::SESSION_NAME, "ops"),
+                (field::WINDOW_ID, "@9"),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+        ]
+        .join("\n");
+        let rows = parse_pane_rows(&output);
+        assert_eq!(focused_pane(&rows, "%0"), Some("%9".to_owned()));
+    }
+
+    #[test]
+    fn an_attached_own_session_outranks_another_clients() {
+        // Two clients in two sessions keep their own sidebars. Ours is the *older*
+        // attachment here, so without the own-session preference both clients'
+        // sidebars would converge on whichever one moved last.
+        let output = [
+            line(&[
+                (field::PANE_ID, "%0"),
+                (field::ROLE, PANE_ROLE_SIDEBAR),
+                (field::SESSION_LAST_ATTACHED, "100"),
+            ]),
+            line(&[
+                (field::PANE_ID, "%1"),
+                (field::SESSION_LAST_ATTACHED, "100"),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+            line(&[
+                (field::PANE_ID, "%9"),
+                (field::SESSION_NAME, "ops"),
+                (field::WINDOW_ID, "@9"),
+                (field::SESSION_LAST_ATTACHED, "200"),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+        ]
+        .join("\n");
+        let rows = parse_pane_rows(&output);
+        assert_eq!(focused_pane(&rows, "%0"), Some("%1".to_owned()));
+    }
+
+    #[test]
+    fn the_most_recently_attached_session_wins_when_ours_is_not() {
+        // With ours detached and two other clients to choose from, the one that
+        // attached last is the one that just moved — the alternative is picking by
+        // whatever order tmux happened to list the sessions in.
+        let output = [
+            line(&[
+                (field::PANE_ID, "%0"),
+                (field::ROLE, PANE_ROLE_SIDEBAR),
+                (field::SESSION_ATTACHED, "0"),
+            ]),
+            line(&[
+                (field::PANE_ID, "%8"),
+                (field::SESSION_NAME, "early"),
+                (field::WINDOW_ID, "@8"),
+                (field::SESSION_LAST_ATTACHED, "100"),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+            line(&[
+                (field::PANE_ID, "%9"),
+                (field::SESSION_NAME, "late"),
+                (field::WINDOW_ID, "@9"),
+                (field::SESSION_LAST_ATTACHED, "200"),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+        ]
+        .join("\n");
+        let rows = parse_pane_rows(&output);
+        assert_eq!(focused_pane(&rows, "%0"), Some("%9".to_owned()));
+
+        // And it is the timestamp deciding, not the listing order: same rows, the
+        // newer attachment listed first.
+        let reversed: Vec<&str> = output.lines().rev().collect();
+        let rows = parse_pane_rows(&reversed.join("\n"));
+        assert_eq!(focused_pane(&rows, "%0"), Some("%9".to_owned()));
+    }
+
+    #[test]
+    fn a_detached_server_leaves_the_cursor_in_our_own_session() {
+        // Nobody is attached, so there is no client to follow. Keeping the cursor
+        // where it is beats dropping it: the sidebars are still polling, and one of
+        // them is where you will reattach.
+        let output = [
+            line(&[
+                (field::PANE_ID, "%0"),
+                (field::ROLE, PANE_ROLE_SIDEBAR),
+                (field::SESSION_ATTACHED, "0"),
+            ]),
+            line(&[
+                (field::PANE_ID, "%1"),
+                (field::SESSION_ATTACHED, "0"),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+        ]
+        .join("\n");
+        let rows = parse_pane_rows(&output);
+        assert_eq!(focused_pane(&rows, "%0"), Some("%1".to_owned()));
+    }
+
+    #[test]
+    fn a_popup_opens_on_the_pane_you_were_in() {
+        // A popup is an overlay owned by the client rather than a pane in any window,
+        // so it has no session of its own to prefer — which is exactly what makes it
+        // follow the client, and open with the cursor where you already were.
+        let output = [
+            line(&[(field::PANE_ID, "%1"), (field::SESSION_ATTACHED, "0")]),
+            line(&[
+                (field::PANE_ID, "%9"),
+                (field::SESSION_NAME, "ops"),
+                (field::WINDOW_ID, "@9"),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+        ]
+        .join("\n");
+        let rows = parse_pane_rows(&output);
+        assert_eq!(focused_pane(&rows, ""), Some("%9".to_owned()));
+    }
+
+    #[test]
     fn focus_is_unknown_when_we_cannot_say_where_it_is() {
         let rows = parse_pane_rows(&line(&[(field::PANE_ID, "%1")]));
-        // A popup is not a pane in any window, so it has no session to resolve
-        // against — and it is transient anyway.
-        assert_eq!(focused_pane(&rows, ""), None);
-        // Our pane has gone; the next poll will tell us it is time to stop.
+        // Our pane has gone; the next poll will tell us it is time to stop. Resolved
+        // before the client's session is even consulted, so a dying sidebar reports
+        // nothing rather than one last answer.
         assert_eq!(focused_pane(&rows, "%404"), None);
 
         // Nothing but a sidebar in the active window: no jump target to name.

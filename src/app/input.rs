@@ -6,7 +6,9 @@
 //! moves ten panes, `12G` goes to the twelfth — which is only aimable because the
 //! relative-number gutter shows the distances (see [`crate::nav`]).
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 
 use super::{App, worker::Worker};
 use crate::nav::{self, Direction};
@@ -17,7 +19,11 @@ pub fn handle(event: Event, app: &mut App, worker: &Worker) {
     match event {
         Event::Key(key) => handle_key(key, app, worker),
         Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::Down(_) => click(app, mouse.row),
+            MouseEventKind::Down(button) => {
+                if click(app, mouse.row, button) {
+                    app.activate_selection();
+                }
+            }
             MouseEventKind::ScrollDown => app.move_selection(1),
             MouseEventKind::ScrollUp => app.move_selection(-1),
             _ => {}
@@ -188,17 +194,26 @@ fn page(app: &App) -> isize {
     ((height / average).max(1)) as isize
 }
 
-/// Move the selection to whatever pane was clicked. Clicks on a session or window
-/// header, or on empty space, are ignored rather than snapping the cursor
-/// somewhere arbitrary.
-fn click(app: &mut App, row: u16) {
+/// Move the cursor to the clicked row; `true` when it should also be activated.
+///
+/// Returns the decision rather than acting on it, like [`App::activation_target`], so
+/// a click is testable without issuing the `switch-client` that would move the tmux
+/// client running the test suite.
+fn click(app: &mut App, row: u16, button: MouseButton) -> bool {
     if row < ui::HEADER_HEIGHT {
-        return;
+        return false;
     }
     let line = (row - ui::HEADER_HEIGHT) as usize + app.scroll;
-    if let Some(block) = app.list.block_at_line(line) {
-        app.selected = block;
-    }
+    let Some(block) = app.list.block_at_line(line) else {
+        return false;
+    };
+    app.selected = block;
+    // Clicking a pane row means "take me there" — the list is a navigator, and making
+    // you click and then press Enter is two gestures for one intention. Left button
+    // only, so a right- or middle-click can move the cursor without moving the client.
+    // Clicking a header or the empty space below the list lands on no block at all,
+    // which is what leaves you a way to put focus in the sidebar with the mouse.
+    button == MouseButton::Left
 }
 
 #[cfg(test)]
@@ -700,29 +715,46 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_pane_row_selects_it() {
+    fn clicking_a_pane_row_selects_it_and_asks_to_jump() {
         let (mut app, worker) = fixture(3);
         let _ = &worker;
         // Row 0 is the app header; the list starts below it. Session and window
         // headers take the first two list lines, so the first pane is at row 3.
         let first_pane_line = app.list.block_line(0);
-        click(&mut app, ui::HEADER_HEIGHT + first_pane_line as u16 + 2);
+        let row = ui::HEADER_HEIGHT + first_pane_line as u16 + 2;
+        assert!(
+            click(&mut app, row, MouseButton::Left),
+            "a left click on a pane row is a jump, not just a cursor move"
+        );
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn a_right_click_moves_the_cursor_without_moving_the_client() {
+        // So a stray or non-primary button cannot switch the client out from under
+        // you — and a right-click stays available for selecting without jumping.
+        let (mut app, worker) = fixture(3);
+        let _ = &worker;
+        let row = ui::HEADER_HEIGHT + app.list.block_line(0) as u16 + 2;
+        assert!(!click(&mut app, row, MouseButton::Right));
         assert_eq!(app.selected, 2);
     }
 
     #[test]
     fn clicking_a_header_or_empty_space_leaves_the_selection_alone() {
+        // Also the one way left to put focus in the sidebar with the mouse, now that
+        // clicking a pane row jumps: land on a row that owns no block.
         let (mut app, worker) = fixture(2);
         let _ = &worker;
         app.selected = 1;
         // The app header.
-        click(&mut app, 0);
+        assert!(!click(&mut app, 0, MouseButton::Left));
         assert_eq!(app.selected, 1);
         // The session header, which owns no block.
-        click(&mut app, ui::HEADER_HEIGHT);
+        assert!(!click(&mut app, ui::HEADER_HEIGHT, MouseButton::Left));
         assert_eq!(app.selected, 1);
         // Far below the last row.
-        click(&mut app, 200);
+        assert!(!click(&mut app, 200, MouseButton::Left));
         assert_eq!(app.selected, 1);
     }
 
@@ -733,7 +765,11 @@ mod tests {
         app.scroll = 5;
         let target_line = 7;
         let expected = app.list.block_at_line(app.scroll + target_line);
-        click(&mut app, ui::HEADER_HEIGHT + target_line as u16);
+        click(
+            &mut app,
+            ui::HEADER_HEIGHT + target_line as u16,
+            MouseButton::Left,
+        );
         if let Some(expected) = expected {
             assert_eq!(app.selected, expected);
         }

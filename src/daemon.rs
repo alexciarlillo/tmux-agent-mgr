@@ -31,7 +31,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::detect::{
-    SCREEN_TAIL_LINES, agent_from_process_name, state_from_evidence, state_from_title,
+    SCREEN_TAIL_LINES, agent_from_command_line, agent_from_process_name, may_host_agent,
+    state_from_evidence, state_from_title,
 };
 use crate::model::{
     AgentEvidence, AgentKind, AgentState, AgentStatus, StatusSource, format_agent_kind,
@@ -42,10 +43,10 @@ use crate::tmux::{self, PaneRow};
 /// Poll interval while at least one agent is Working or Blocked. Matches the
 /// cadence a spinner needs to look live.
 const ACTIVE_INTERVAL: Duration = Duration::from_millis(300);
-/// Poll interval when every pane is idle. Idle Claude panes need a
-/// `capture-pane` each poll (its idle title is never conclusive), so backing off
-/// here is most of the daemon's cost saved for the common case: a workspace
-/// sitting still.
+/// Poll interval when every pane is idle. Idle agent panes need a `capture-pane`
+/// each poll — Claude's idle title is never conclusive, and Codex sets no title
+/// at all — so backing off here is most of the daemon's cost saved for the common
+/// case: a workspace sitting still.
 const QUIET_INTERVAL: Duration = Duration::from_millis(1000);
 /// How many polls between checks that we are still the registered daemon.
 const OWNERSHIP_CHECK_POLLS: u32 = 10;
@@ -187,9 +188,10 @@ fn reconcile(
     let now = tmux::unix_timestamp();
     let live: HashSet<&str> = rows.iter().map(|row| row.pane.pane_id.as_str()).collect();
 
-    // Built lazily: only needed once a pane's foreground command stops looking
-    // like an agent, or a pane claims hook state, so a workspace of plain shells
-    // never pays for a `ps`.
+    // Built lazily, and at most once per pass: needed only when a pane claims
+    // hook state, was an agent last poll, or runs something that could be
+    // hosting one (see `may_host_agent`). A workspace of plain shells never pays
+    // for a `ps`.
     let mut processes: Option<ProcessTree> = None;
     let mut resolved = Vec::new();
 
@@ -267,18 +269,28 @@ fn read_pane(row: &PaneRow, processes: &mut Option<ProcessTree>) -> Option<Readi
 
     let agent = match passive_agent {
         Some(agent) => agent,
-        // The foreground command no longer looks like an agent. Keep the
-        // previously detected agent only while one is genuinely still running
-        // under this pane — it may have spawned a foreground child. If `ps`
-        // can't be read this poll, keep it too: a transient failure must not
-        // drop a live agent to unknown.
+        // The foreground command doesn't name an agent. Ask the process tree,
+        // which answers both halves of the question at once: *whether* an agent
+        // is alive under this pane, and *which* one.
+        //
+        // Both halves matter. A pane that was an agent last poll may have
+        // spawned a foreground child, and must not drop to unknown for it. And a
+        // pane that never looked like an agent may still be one — an npm-shim
+        // Codex install runs as `node`, so without this it would never be
+        // detected at all.
         None => {
-            let previous = row.pane.status.agent?;
-            let tree = processes.get_or_insert_with(ProcessTree::snapshot);
-            if tree.unavailable() || tree.has_agent_under(row.pane.pane_pid) {
-                previous
-            } else {
+            let previous = row.pane.status.agent;
+            // Don't pay for a `ps` unless there's a reason to, so a workspace of
+            // plain shells stays free.
+            if previous.is_none() && !may_host_agent(&row.pane.current_command) {
                 return None;
+            }
+            let tree = processes.get_or_insert_with(ProcessTree::snapshot);
+            if tree.unavailable() {
+                // A transient `ps` failure must not tear down live state.
+                previous?
+            } else {
+                tree.agent_under(row.pane.pane_pid)?
             }
         }
     };
@@ -310,10 +322,32 @@ fn passive_state(agent: AgentKind, row: &PaneRow) -> AgentState {
         return state;
     }
     let evidence = AgentEvidence {
-        screen_tail: capture_tail(&row.pane.pane_id, SCREEN_TAIL_LINES),
+        screen_tail: capture_screen(agent, &row.pane.pane_id),
         osc_title: row.pane.title.clone(),
     };
     state_from_evidence(agent, &evidence)
+}
+
+/// How much of a pane to read, which differs by agent because they anchor their
+/// UI differently.
+///
+/// Claude draws its input box at the bottom of the screen, so a fixed window of
+/// trailing lines is enough, and bounding it is what stops old scrollback from
+/// pinning a stale state.
+///
+/// Codex grows downward from the top until its transcript fills the pane, so its
+/// status line and modals can sit well above that window — a fresh session in a
+/// 92-row pane puts them around row 12, which a bottom-anchored window misses
+/// entirely, reporting a working agent as idle. Read its visible screen instead
+/// and nothing above it: everything on the visible screen is current by
+/// definition, so there is no staleness to bound.
+fn capture_screen(agent: AgentKind, pane_id: &str) -> String {
+    match agent {
+        AgentKind::Claude => capture_tail(pane_id, SCREEN_TAIL_LINES),
+        AgentKind::Codex => {
+            tmux::run_tmux(&["capture-pane", "-pJ", "-t", pane_id]).unwrap_or_default()
+        }
+    }
 }
 
 /// Capture the tail of a pane's visible screen as plain text.
@@ -603,10 +637,11 @@ fn pid_alive(pid: &str) -> bool {
 // ─── process tree ────────────────────────────────────────────────────
 
 /// A snapshot of the process table, used to tell "the agent exited" from "the
-/// agent is running a foreground child".
+/// agent is running a foreground child", and to name the agent when the pane's
+/// foreground command doesn't.
 pub struct ProcessTree {
     children: HashMap<u32, Vec<u32>>,
-    agent_pids: HashSet<u32>,
+    agents: HashMap<u32, AgentKind>,
 }
 
 impl ProcessTree {
@@ -620,33 +655,31 @@ impl ProcessTree {
         Self::parse(&output)
     }
 
+    /// Parse `ps -Ao pid=,ppid=,comm=,args=` output.
+    ///
+    /// Note the layout: `args` is the *whole* command line, so it repeats
+    /// `argv[0]` rather than continuing where `comm` left off. For the npm-shim
+    /// install of Codex the line reads
+    /// `164514 78674 node node /usr/local/bin/codex` — which is why naming the
+    /// agent takes [`agent_from_command_line`] and not just the first token.
     fn parse(output: &str) -> Self {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        let mut agent_pids = HashSet::new();
+        let mut agents = HashMap::new();
 
         for line in output.lines() {
-            let mut fields = line.split_whitespace();
-            let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) else {
-                continue;
-            };
-            let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            let Some((pid, ppid, comm, args)) = split_ps_line(line) else {
                 continue;
             };
             children.entry(ppid).or_default().push(pid);
 
-            let comm = fields.next().unwrap_or_default();
-            // Check the argv[0] path too: an agent launched through a wrapper can
-            // report `node` as its comm while its command line names the agent.
-            let argv0 = fields.next().unwrap_or_default().trim_matches('"');
-            if agent_from_process_name(comm).is_some() || agent_from_process_name(argv0).is_some() {
-                agent_pids.insert(pid);
+            if let Some(agent) =
+                agent_from_process_name(comm).or_else(|| agent_from_command_line(args))
+            {
+                agents.insert(pid, agent);
             }
         }
 
-        Self {
-            children,
-            agent_pids,
-        }
+        Self { children, agents }
     }
 
     /// `true` when the snapshot captured nothing, i.e. `ps` failed. Callers treat
@@ -656,26 +689,43 @@ impl ProcessTree {
         self.children.is_empty()
     }
 
-    /// `true` if `root` or any of its descendants is an agent process.
-    fn has_agent_under(&self, root: Option<u32>) -> bool {
-        let Some(root) = root else {
-            return false;
-        };
+    /// The agent `root` or one of its descendants is running, if any.
+    ///
+    /// This is how a pane whose foreground command is a bare `node` still gets
+    /// named: the npm shim's child is the real `codex` binary.
+    fn agent_under(&self, root: Option<u32>) -> Option<AgentKind> {
+        let root = root?;
         let mut stack = vec![root];
         let mut seen = HashSet::new();
         while let Some(pid) = stack.pop() {
             if !seen.insert(pid) {
                 continue;
             }
-            if self.agent_pids.contains(&pid) {
-                return true;
+            if let Some(agent) = self.agents.get(&pid) {
+                return Some(*agent);
             }
             if let Some(children) = self.children.get(&pid) {
                 stack.extend(children.iter().copied());
             }
         }
-        false
+        None
     }
+
+    /// `true` if `root` or any of its descendants is an agent process.
+    fn has_agent_under(&self, root: Option<u32>) -> bool {
+        self.agent_under(root).is_some()
+    }
+}
+
+/// Split one `ps -Ao pid=,ppid=,comm=,args=` line into its four columns, the
+/// last of which keeps its spaces.
+fn split_ps_line(line: &str) -> Option<(u32, u32, &str, &str)> {
+    let rest = line.trim_start();
+    let (pid, rest) = rest.split_once(char::is_whitespace)?;
+    let (ppid, rest) = rest.trim_start().split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let (comm, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    Some((pid.parse().ok()?, ppid.parse().ok()?, comm, args.trim_start()))
 }
 
 #[cfg(test)]
@@ -1023,9 +1073,53 @@ mod tests {
 
     #[test]
     fn process_tree_matches_an_agent_behind_a_node_wrapper() {
-        // comm says `node`; only argv[0] names the agent.
-        let wrapped = ProcessTree::parse("10 1 zsh zsh\n11 10 node /usr/local/bin/codex\n");
+        // Real `ps -Ao pid=,ppid=,comm=,args=` output for an npm-installed Codex.
+        // Note that `args` repeats argv[0], so the column after `comm` is another
+        // `node` — the fixture this test used to carry (`… node /usr/local/bin/codex`
+        // with no repeat) is not a shape `ps` emits, which is how the wrapper
+        // case passed its test while not working.
+        let wrapped =
+            ProcessTree::parse("10 1 zsh -zsh\n11 10 node node /usr/local/bin/codex\n");
         assert!(wrapped.has_agent_under(Some(10)));
+        assert_eq!(wrapped.agent_under(Some(10)), Some(AgentKind::Codex));
+    }
+
+    #[test]
+    fn process_tree_names_the_agent_not_just_its_presence() {
+        // The npm shim's own child is the real binary, and either route must
+        // resolve to Codex — this is what lets a pane whose foreground command is
+        // a bare `node` be detected at all.
+        let tree = ProcessTree::parse(concat!(
+            "78674 78558 zsh -zsh\n",
+            "164514 78674 node node /usr/local/bin/codex\n",
+            "164579 164514 codex /usr/local/lib/node_modules/@openai/codex/vendor/bin/codex\n",
+        ));
+        assert_eq!(tree.agent_under(Some(78674)), Some(AgentKind::Codex));
+        assert_eq!(tree.agent_under(Some(164579)), Some(AgentKind::Codex));
+
+        // A pane running an unrelated `node` is still not an agent pane.
+        let unrelated = ProcessTree::parse(concat!(
+            "10 1 zsh -zsh\n",
+            "11 10 node node --experimental-sqlite /opt/language-server.js\n",
+        ));
+        assert_eq!(unrelated.agent_under(Some(10)), None);
+    }
+
+    #[test]
+    fn a_ps_line_keeps_its_spaces_in_the_args_column() {
+        // comm is one token; everything after it is the command line, spaces and
+        // all. Getting this wrong is what broke wrapper detection.
+        assert_eq!(
+            split_ps_line("  164514  78674 node            node /usr/local/bin/codex"),
+            Some((164514, 78674, "node", "node /usr/local/bin/codex"))
+        );
+        // A kernel thread has no arguments.
+        assert_eq!(
+            split_ps_line("2 0 kthreadd [kthreadd]"),
+            Some((2, 0, "kthreadd", "[kthreadd]"))
+        );
+        assert_eq!(split_ps_line(""), None);
+        assert_eq!(split_ps_line("not a ps line"), None);
     }
 
     #[test]
