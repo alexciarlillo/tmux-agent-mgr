@@ -11,6 +11,6 @@ pub use commands::{
 };
 pub use options::*;
 pub use query::{
-    PaneRow, apply_session_order, group_sessions, list_panes, persist_session_order, session_order,
-    unique_by_pane,
+    PaneRow, apply_session_order, focused_pane, group_sessions, list_panes, persist_session_order,
+    session_order, unique_by_pane,
 };

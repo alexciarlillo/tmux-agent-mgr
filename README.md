@@ -67,15 +67,26 @@ pane latched to "running".
 |---|---|
 | `prefix + e` | toggle the sidebar in this window |
 | `prefix + E` | toggle it in every window |
+| `prefix + o` | jump into the sidebar, or back out to where you were |
 | `C-n` | open the full-screen popup (no prefix) |
+
+Opening the sidebar puts you in it. `prefix + E` focuses only the one in the window
+you pressed it in — the other windows keep the pane they were on. `prefix + o` is the
+round trip afterwards: into the sidebar, and out again to the pane you came from.
 
 The **sidebar** is narrow and persistent. The **popup** is the same list
 full-screen with a live preview of the selected window beside it, and it closes
 itself as soon as you jump somewhere — it's a chooser, not a place to live.
 
+The cursor follows tmux: move between panes, windows or sessions by any means — the
+keys below, `C-h/j/k/l`, your own bindings, the mouse — and the highlighted row is
+the pane you are actually in. Move it yourself and it stays where you put it.
+
 The preview mirrors the window's layout *and* its colours, because recognising a
 window at a glance is mostly recognising its palette. Text the pane didn't colour is
-drawn muted, so the mirror still reads as a mirror.
+drawn muted, so the mirror still reads as a mirror. The selected pane's outline is
+drawn in the accent colour and tmux's own active pane keeps a heavier border, so
+moving through the panes of one window is something you can see.
 
 ### Inside the list
 
@@ -117,6 +128,18 @@ it composes with the status filter rather than replacing it.
 `●` working · `◉` blocked, needs you · `●` finished and unread · `○` idle ·
 `✕` errored · `·` no agent. A `┃` marks the pane tmux is actually focused on.
 
+A window holding one pane — most of them — has no header line of its own; its name
+sits on the pane's row instead, and only a split window is listed as two levels:
+
+```
+ dev
+ ◉ 1 api claude  plan         1m12s
+     feat/auth ~wt-auth
+   2 editor
+   ┃○ 0 nvim
+    ● 1 claude                  14s
+```
+
 The lines below the first appear only when there is something to say. The branch
 row comes from git; the permission badge, wait reason, subagents and task progress
 come from [agent hooks](#optional-claude-code-hooks). A trailing `?` on the agent
@@ -150,6 +173,7 @@ Set these **before** the plugin loads; it only fills in what you haven't.
 | `@agent_mgr_nav` | `on` | the `C-h/j/k/l` bindings above |
 | `@agent_mgr_key` | `e` | prefix key toggling the sidebar here |
 | `@agent_mgr_key_all` | `E` | prefix key toggling it everywhere |
+| `@agent_mgr_key_focus` | `o` | prefix key jumping into the sidebar and back; `none` binds nothing |
 | `@agent_mgr_key_popup` | `C-n` | prefix-less popup key; `none` binds nothing |
 
 Colors take a `#RRGGBB` or a 0–255 palette index:

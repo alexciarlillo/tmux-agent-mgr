@@ -31,7 +31,7 @@ do this?" — usually the answer is no.
 ## Commands
 
 ```sh
-cargo test                  # 317 tests, all pure — no tmux server required
+cargo test                  # 343 tests, all pure — no tmux server required
 cargo clippy --all-targets  # must be warning-clean
 cargo build --release
 ./target/release/agent-mgr daemon --once   # resolved per-pane state as TSV
@@ -73,7 +73,7 @@ somewhere else first.
 
 ```
 main.rs        argv dispatch: (no args)=sidebar | popup | toggle | toggle-all
-               | resize | auto-close | daemon [--once] | hook <agent> <event>
+               | focus | resize | auto-close | daemon [--once] | hook <agent> <event>
 model.rs       AgentKind/State/Status, PermissionMode, the tree types, and the
                option string round-trips. Both status vocabularies merge here.
 detect.rs      passive detection: process name -> agent, title + screen -> state.
@@ -85,18 +85,21 @@ hook/mod.rs    `hook <agent> <event>`: stdin JSON, pane state read, apply writes
 hook/claude.rs the Claude Code mapping. Pure: plan(event, payload, state, now).
 git.rs         branch + worktree for a path, TTL-cached including negative results.
 pane.rs        sidebar pane lifecycle: resolve_width's clamp order, which side the
-               split lands on, should_kill_window's multi-client guard.
+               split lands on, should_kill_window's multi-client guard, and who
+               takes focus on open (Focus, focus_action).
 nav.rs         counted motions, session edges, relative numbering.
 search.rs      the `/` query: terms ANDed across session/window/command/branch/
                worktree/agent.
 preview.rs     popup-only window mirror: capture, ANSI parse, fixed-grid compose.
-app/mod.rs     the event loop, dirty-flag redraw, fingerprint, rebuild.
+app/mod.rs     the event loop, dirty-flag redraw, fingerprint, rebuild, and
+               apply_focus — the cursor follows tmux focus, but only on a change.
 app/worker.rs  the only place subprocesses run while the TUI is open.
 app/input.rs   key handling, including the vim-ish modes.
 ui/*           draw dispatch by Surface, row composition, help page, display-width
                text helpers, theme.
 tmux/*         commands (two error conventions), options (every key as a const),
-               query (one `list-panes -a` builds the whole hierarchy).
+               query (one `list-panes -a` builds the whole hierarchy, and
+               focused_pane reads which pane tmux focus is on from the same rows).
 ```
 
 Non-Rust, and just as load-bearing:

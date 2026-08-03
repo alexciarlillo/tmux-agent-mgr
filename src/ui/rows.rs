@@ -8,6 +8,11 @@
 //! context lines that have something to say. Selection and navigation operate on
 //! blocks, never on individual lines, so moving down always lands on the next
 //! pane rather than on that pane's branch row.
+//!
+//! A window holding a single pane has no header row of its own: the window's
+//! `index name` becomes that pane's row prefix instead. Most windows hold one pane,
+//! so the header would otherwise spend half the sidebar's lines restating what the
+//! row below it already says. See [`Shape`].
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -90,6 +95,42 @@ impl Default for Options {
             now: 0,
             numbers: false,
         }
+    }
+}
+
+/// How a pane's rows sit in the hierarchy.
+///
+/// One of several panes sits *under* its window's header, indented past it. The only
+/// pane of a window absorbs that header instead — same row, with the window's
+/// `index name` in front of the agent label. Both cases produce one block, so
+/// navigation cannot tell them apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Shape {
+    /// The window has its own header row above this one.
+    UnderHeader,
+    /// This row *is* the window header as well.
+    Merged,
+}
+
+impl Shape {
+    /// Columns the status line is indented by. A merged row takes the header's
+    /// indent, so a column of windows still lines up whether or not they collapsed.
+    fn indent(self) -> usize {
+        match self {
+            Self::UnderHeader => 2,
+            Self::Merged => 1,
+        }
+    }
+
+    /// Indent for the context rows beneath the status line — two past it either way.
+    fn context_indent(self) -> usize {
+        self.indent() + 2
+    }
+
+    /// Whether the pane index is worth the columns: only when there is a sibling
+    /// pane to tell this one apart from.
+    fn shows_pane_index(self) -> bool {
+        self == Self::UnderHeader
     }
 }
 
@@ -215,8 +256,14 @@ pub fn build(sessions: &[SessionGroup], opts: &Options, theme: &Theme) -> Render
     for session in sessions {
         session_header(&mut builder, session);
         for window in &session.windows {
-            window_header(&mut builder, window);
-            let multi_pane = window.panes.len() > 1;
+            let shape = if window.panes.len() > 1 {
+                Shape::UnderHeader
+            } else {
+                Shape::Merged
+            };
+            if shape == Shape::UnderHeader {
+                window_header(&mut builder, window);
+            }
             for pane in &window.panes {
                 let block = builder.blocks.len();
                 if opts.numbers {
@@ -227,7 +274,7 @@ pub fn build(sessions: &[SessionGroup], opts: &Options, theme: &Theme) -> Render
                     session,
                     window,
                     pane,
-                    multi_pane,
+                    shape,
                     block == opts.selected,
                 );
             }
@@ -281,7 +328,7 @@ fn pane_block(
     session: &SessionGroup,
     window: &WindowInfo,
     pane: &PaneInfo,
-    show_index: bool,
+    shape: Shape,
     selected: bool,
 ) {
     let line_start = builder.lines.len();
@@ -290,8 +337,8 @@ fn pane_block(
     // window is also the current one — otherwise every window would show one.
     let active = pane.pane_active && window.window_active;
 
-    status_line(builder, pane, show_index, active, bg);
-    context_lines(builder, pane, bg);
+    status_line(builder, window, pane, shape, active, bg);
+    context_lines(builder, pane, shape.context_indent(), bg);
 
     builder.blocks.push(Block {
         target: PaneTarget {
@@ -304,27 +351,32 @@ fn pane_block(
     });
 }
 
-/// `┃● claude plan          1m12s`
+/// `┃● claude plan          1m12s`, or `┃● 1 editor claude     1m12s` merged.
 ///
 /// The elapsed label is right-aligned and reserved for first, so a long session
 /// name is what gets truncated rather than pushing the timer off screen.
 fn status_line(
     builder: &mut Builder,
+    window: &WindowInfo,
     pane: &PaneInfo,
-    show_index: bool,
+    shape: Shape,
     active: bool,
     bg: Option<Color>,
 ) {
     let theme = builder.theme;
     let status = &pane.status;
-    let indent = 2;
+    let indent = shape.indent();
     let inner = builder.inner(indent);
 
     let (icon, icon_color) = icon_for(status, builder.spinner, theme);
     let badge = status.permission_mode.badge();
     let elapsed = elapsed_label(status.run_started_at, builder.now);
 
-    let label_raw = pane_label(pane, show_index);
+    let label_raw = pane_label(pane, shape.shows_pane_index());
+    let prefix_raw = match shape {
+        Shape::Merged => format!("{} {}", window.window_index, window.window_name),
+        Shape::UnderHeader => String::new(),
+    };
     let fixed = width(icon) + 1 + if badge.is_empty() { 0 } else { width(badge) + 1 };
     // Reserve the timer's *maximum* width, not its current width, so the label
     // budget stays fixed for the life of a run. Reserving the actual width would
@@ -334,9 +386,19 @@ fn status_line(
     } else {
         ELAPSED_MAX_WIDTH + 1
     };
-    let label = truncate(&label_raw, inner.saturating_sub(fixed + reserved));
+    let budget = inner.saturating_sub(fixed + reserved);
+    let label = truncate(&label_raw, budget);
+    // The window name is what gives way when a merged row runs out of columns: the
+    // agent label and the timer are the two things you scan a row *for*, and a name
+    // clipped to a lone `…` would cost a cell to say nothing.
+    let prefix = window_prefix(&prefix_raw, budget.saturating_sub(width(&label) + 1));
 
-    let left_width = fixed + width(&label);
+    let prefix_width = if prefix.is_empty() {
+        0
+    } else {
+        1 + width(&prefix)
+    };
+    let left_width = fixed + prefix_width + width(&label);
     // Re-clamp: on a very narrow sidebar the label may already have eaten the
     // room the timer wanted.
     let elapsed = truncate(&elapsed, inner.saturating_sub(left_width));
@@ -346,13 +408,27 @@ fn status_line(
         None => style,
     };
 
-    let mut spans = vec![
-        Span::styled(icon.to_owned(), with_bg(Style::default().fg(icon_color))),
-        Span::styled(
-            format!(" {label}"),
-            with_bg(Style::default().fg(theme.agent_color(status.agent))),
-        ),
-    ];
+    let mut spans = vec![Span::styled(
+        icon.to_owned(),
+        with_bg(Style::default().fg(icon_color)),
+    )];
+    if !prefix.is_empty() {
+        // Coloured as the window header it replaced, so a merged row still reads as
+        // two things joined rather than one long name.
+        let color = if window.window_active {
+            theme.text
+        } else {
+            theme.window
+        };
+        spans.push(Span::styled(
+            format!(" {prefix}"),
+            with_bg(Style::default().fg(color)),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" {label}"),
+        with_bg(Style::default().fg(theme.agent_color(status.agent))),
+    ));
     if !badge.is_empty() {
         spans.push(Span::styled(
             format!(" {badge}"),
@@ -386,12 +462,24 @@ fn status_line(
     );
 }
 
+/// The window label on a merged row, or nothing when there is no room worth using.
+///
+/// Under two cells `truncate` would return a bare `…`, which spends a column to say
+/// nothing; dropping it leaves the row to the agent label and the timer.
+fn window_prefix(prefix: &str, room: usize) -> String {
+    /// Narrowest prefix still carrying information — the window index and an ellipsis.
+    const MIN_WIDTH: usize = 2;
+    if prefix.is_empty() || room < MIN_WIDTH {
+        return String::new();
+    }
+    truncate(prefix, room)
+}
+
 /// The context rows beneath a pane. Each is conditional: a pane with nothing to
 /// report stays one line tall, which is what keeps a long list readable.
-fn context_lines(builder: &mut Builder, pane: &PaneInfo, bg: Option<Color>) {
+fn context_lines(builder: &mut Builder, pane: &PaneInfo, indent: usize, bg: Option<Color>) {
     let theme = builder.theme;
     let status = &pane.status;
-    let indent = 4;
 
     // The overwhelmingly common case is a pane with nothing extra to say.
     if pane.branch.is_empty() && pane.worktree.is_empty() && !status.has_hook_detail() {
@@ -610,6 +698,108 @@ mod tests {
     }
 
     #[test]
+    fn every_line_of_a_merged_row_is_exactly_the_requested_width() {
+        // Same contract on the collapsed path, where the window label shares the
+        // budget with the agent label and the timer.
+        let mut sessions = tree(vec![{
+            let mut pane = pane("%1", agent_status(AgentState::Working));
+            pane.branch = "feature/a-rather-long-branch-name".to_owned();
+            pane.worktree = "wt-long-name".to_owned();
+            pane.status.permission_mode = PermissionMode::BypassPermissions;
+            pane.status.run_started_at = Some(0);
+            pane.status.wait_reason = "permission".to_owned();
+            pane.status.task_progress = Some(TaskProgress { done: 3, total: 7 });
+            pane
+        }]);
+        sessions[0].windows[0].window_name = "a-rather-long-window-name".to_owned();
+
+        for total in [12, 20, 24, 32, 40, 80] {
+            let list = opts_render(
+                &sessions,
+                &Options {
+                    total_width: total,
+                    now: 1_000,
+                    numbers: true,
+                    ..Options::default()
+                },
+            );
+            for (index, line) in list.plain.iter().enumerate() {
+                assert_eq!(
+                    width(line),
+                    total,
+                    "line {index} at width {total}: {line:?}"
+                );
+            }
+        }
+    }
+
+    // ─── merged single-pane rows ──────────────────────────────────────
+
+    #[test]
+    fn a_window_with_one_pane_has_no_header_row_of_its_own() {
+        // Most windows hold one pane, so a header restating what the row below it
+        // already says is half the sidebar's lines spent on our own structure.
+        let list = render(&tree(vec![pane("%1", agent_status(AgentState::Idle))]), 0, 40);
+        assert_eq!(list.lines.len(), 2, "session header, then the merged row");
+        assert_eq!(list.blocks[0].line_start, 1);
+        let merged = &list.plain[1];
+        assert!(merged.contains("1 editor"), "the window label: {merged:?}");
+        assert!(merged.contains("claude"), "and the agent label: {merged:?}");
+    }
+
+    #[test]
+    fn a_window_with_two_panes_keeps_its_header_row() {
+        let mut second = pane("%2", agent_status(AgentState::Idle));
+        second.pane_index = "1".to_owned();
+        let list = render(
+            &tree(vec![pane("%1", agent_status(AgentState::Idle)), second]),
+            0,
+            40,
+        );
+        assert_eq!(list.plain[1].trim(), "1 editor", "the header stands alone");
+        assert_eq!(list.blocks[0].line_start, 2);
+        assert!(list.block_at_line(1).is_none(), "a header belongs to no block");
+    }
+
+    #[test]
+    fn a_merged_row_indents_its_context_rows_under_itself() {
+        // Two past the status line, as under an unmerged row — the offset is what
+        // says "these belong to the row above".
+        let mut only = pane("%1", agent_status(AgentState::Idle));
+        only.branch = "main".to_owned();
+        let list = render(&tree(vec![only]), 0, 40);
+        assert_eq!(list.blocks[0].line_count, 2, "merged row plus the branch row");
+        // Marker cell, its trailing space, then the context indent of 3.
+        assert!(list.plain[2].starts_with("     main"), "{:?}", list.plain[2]);
+        assert!(!list.plain[2].starts_with("      "), "one indent too deep");
+    }
+
+    #[test]
+    fn the_window_name_is_what_gives_way_on_a_narrow_merged_row() {
+        // The agent label and the timer are what you scan a row for; a clipped
+        // window name still identifies the window, a clipped timer identifies
+        // nothing.
+        let mut sessions = tree(vec![pane("%1", agent_status(AgentState::Working))]);
+        sessions[0].windows[0].window_name = "a-very-long-window-name".to_owned();
+        sessions[0].windows[0].panes[0].status.run_started_at = Some(0);
+
+        let row = &render(&sessions, 0, 30).plain[1];
+        assert!(row.contains('…'), "the name should be cut: {row:?}");
+        assert!(row.contains("claude"), "the agent label survives: {row:?}");
+        assert!(row.trim_end().ends_with("16m"), "the timer survives: {row:?}");
+    }
+
+    #[test]
+    fn a_window_label_with_no_room_left_is_dropped_rather_than_shown_as_an_ellipsis() {
+        // One cell spent on a bare `…` says nothing at all.
+        assert_eq!(window_prefix("1 editor", 0), "");
+        assert_eq!(window_prefix("1 editor", 1), "");
+        assert_eq!(window_prefix("1 editor", 2), "1…");
+        assert_eq!(window_prefix("1 editor", 99), "1 editor");
+        assert_eq!(window_prefix("", 99), "");
+    }
+
+    #[test]
     fn a_quiet_pane_stays_one_line_tall() {
         let list = render(&tree(vec![pane("%1", agent_status(AgentState::Idle))]), 0, 40);
         assert_eq!(list.blocks.len(), 1);
@@ -687,9 +877,10 @@ mod tests {
 
     #[test]
     fn pane_indexes_show_only_in_multi_pane_windows() {
+        // The single pane's row is merged with the window header, so it is line 1.
         let single = render(&tree(vec![pane("%1", agent_status(AgentState::Idle))]), 0, 40);
-        assert!(single.plain[2].contains("claude"));
-        assert!(!single.plain[2].contains("0 claude"));
+        assert!(single.plain[1].contains("claude"));
+        assert!(!single.plain[1].contains("0 claude"));
 
         let mut second = pane("%2", agent_status(AgentState::Idle));
         second.pane_index = "1".to_owned();
@@ -793,8 +984,8 @@ mod tests {
                 ..Options::default()
             },
         );
-        assert_eq!(&list.plain[2][..1], "0", "the status line carries it");
-        assert_eq!(&list.plain[3][..1], " ", "the branch line does not");
+        assert_eq!(&list.plain[1][..1], "0", "the status line carries it");
+        assert_eq!(&list.plain[2][..1], " ", "the branch line does not");
     }
 
     #[test]
@@ -823,11 +1014,12 @@ mod tests {
     fn the_gutter_is_absent_entirely_when_numbers_are_off() {
         let list = render(&tree(vec![pane("%1", AgentStatus::unknown())]), 0, 40);
         // Without a gutter the marker cell is first, and an inactive pane's marker
-        // is a space — so the leading cells are the indent, not a number.
+        // is a space — so the leading cells are the marker and the indent, then the
+        // state glyph, with no digit anywhere.
         assert!(
-            list.plain[2].starts_with("    "),
+            list.plain[1].starts_with("   ·"),
             "unexpected leading cells: {:?}",
-            &list.plain[2][..6]
+            &list.plain[1][..6]
         );
     }
 
@@ -873,10 +1065,10 @@ mod tests {
             pane.pane_active = true;
             pane
         }]);
-        assert!(render(&sessions, 0, 40).plain[2].starts_with('┃'));
+        assert!(render(&sessions, 0, 40).plain[1].starts_with('┃'));
 
         sessions[0].windows[0].window_active = false;
-        assert!(!render(&sessions, 0, 40).plain[2].starts_with('┃'));
+        assert!(!render(&sessions, 0, 40).plain[1].starts_with('┃'));
     }
 
     #[test]
@@ -893,7 +1085,7 @@ mod tests {
 
         // Everything before the truncation ellipsis is the label we kept.
         let label_of = |line: &str| line.split('…').next().unwrap_or_default().to_owned();
-        assert_eq!(label_of(&short_run.plain[2]), label_of(&long_run.plain[2]));
+        assert_eq!(label_of(&short_run.plain[1]), label_of(&long_run.plain[1]));
     }
 
     #[test]
@@ -904,7 +1096,7 @@ mod tests {
         sessions[0].windows[0].panes[0].status.agent = None;
 
         let list = render(&sessions, 0, 30);
-        let status_line = &list.plain[2];
+        let status_line = &list.plain[1];
         assert!(status_line.contains('…'), "label should be cut: {status_line:?}");
         assert!(
             status_line.trim_end().ends_with("16m"),

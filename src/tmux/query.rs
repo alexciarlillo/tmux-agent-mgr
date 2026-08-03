@@ -29,28 +29,31 @@ mod field {
     pub const PANE_ID: usize = 6;
     pub const PANE_INDEX: usize = 7;
     pub const PANE_ACTIVE: usize = 8;
-    pub const PANE_CURRENT_COMMAND: usize = 9;
-    pub const PANE_CURRENT_PATH: usize = 10;
-    pub const PANE_TITLE: usize = 11;
-    pub const PANE_PID: usize = 12;
-    pub const ROLE: usize = 13;
-    pub const AGENT: usize = 14;
-    pub const STATE: usize = 15;
-    pub const SOURCE: usize = 16;
-    pub const SEEN: usize = 17;
-    pub const RUN_STARTED_AT: usize = 18;
-    pub const HOOK_AGENT: usize = 19;
-    pub const HOOK_STATE: usize = 20;
-    pub const HOOK_UPDATED: usize = 21;
-    pub const PERMISSION_MODE: usize = 22;
-    pub const WAIT_REASON: usize = 23;
-    pub const SUBAGENTS: usize = 24;
-    pub const TASK_DONE: usize = 25;
-    pub const TASK_TOTAL: usize = 26;
-    pub const BG_CMD: usize = 27;
-    pub const CWD: usize = 28;
+    /// The window's *previously* active pane — what focus returns to. Read so a
+    /// sidebar holding focus can still say which pane you came from.
+    pub const PANE_LAST: usize = 9;
+    pub const PANE_CURRENT_COMMAND: usize = 10;
+    pub const PANE_CURRENT_PATH: usize = 11;
+    pub const PANE_TITLE: usize = 12;
+    pub const PANE_PID: usize = 13;
+    pub const ROLE: usize = 14;
+    pub const AGENT: usize = 15;
+    pub const STATE: usize = 16;
+    pub const SOURCE: usize = 17;
+    pub const SEEN: usize = 18;
+    pub const RUN_STARTED_AT: usize = 19;
+    pub const HOOK_AGENT: usize = 20;
+    pub const HOOK_STATE: usize = 21;
+    pub const HOOK_UPDATED: usize = 22;
+    pub const PERMISSION_MODE: usize = 23;
+    pub const WAIT_REASON: usize = 24;
+    pub const SUBAGENTS: usize = 25;
+    pub const TASK_DONE: usize = 26;
+    pub const TASK_TOTAL: usize = 27;
+    pub const BG_CMD: usize = 28;
+    pub const CWD: usize = 29;
     /// Number of fields a well-formed line must have.
-    pub const COUNT: usize = 29;
+    pub const COUNT: usize = 30;
 }
 
 const DELIMITER: char = '|';
@@ -66,6 +69,7 @@ fn format_fields() -> Vec<String> {
         q("pane_id"),
         q("pane_index"),
         q("pane_active"),
+        q("pane_last"),
         q("pane_current_command"),
         q("pane_current_path"),
         q("pane_title"),
@@ -127,6 +131,10 @@ pub struct PaneRow {
     pub window_index: String,
     pub window_name: String,
     pub window_active: bool,
+    /// `#{pane_last}`: the pane focus would return to in this window. Kept on the row
+    /// rather than on [`PaneInfo`] because only focus resolution wants it and nothing
+    /// renders it.
+    pub pane_last: bool,
     /// `@agent_mgr_pane_role`; `sidebar` for our own pane.
     pub role: String,
     pub pane: PaneInfo,
@@ -207,6 +215,7 @@ fn parse_pane_row(line: &str) -> Option<PaneRow> {
         window_index: f[field::WINDOW_INDEX].clone(),
         window_name: f[field::WINDOW_NAME].clone(),
         window_active: f[field::WINDOW_ACTIVE] == "1",
+        pane_last: f[field::PANE_LAST] == "1",
         role: f[field::ROLE].clone(),
         pane: PaneInfo {
             pane_id: f[field::PANE_ID].clone(),
@@ -250,6 +259,41 @@ fn task_progress(done: Option<u32>, total: Option<u32>) -> Option<TaskProgress> 
         done: done.unwrap_or(0),
         total,
     })
+}
+
+/// The pane tmux focus is on, seen from the sidebar living in `own_pane`.
+///
+/// This is what lets the cursor follow the plugin's own `C-h/j/k/l` bindings instead
+/// of being left behind by them: the list and the terminal disagreeing about "here"
+/// is how you end up acting on the wrong pane.
+///
+/// Resolved against *our own session* rather than "whichever session is attached",
+/// because several can be, and only ours tells us which window and pane this sidebar
+/// is looking at. Following the session's active window — not just our own window —
+/// means the sidebar you come back to has tracked where you went.
+///
+/// A sidebar holding focus is not a jump target (it is furniture, and it is excluded
+/// from the list anyway), so we fall back to the window's last pane: the one you came
+/// from, which is exactly where the cursor should sit when you land in the sidebar.
+///
+/// `None` when we cannot say — no `own_pane` (a popup, which is not a pane in any
+/// window), our pane already gone, or nothing but sidebars in the active window.
+pub fn focused_pane(rows: &[PaneRow], own_pane: &str) -> Option<String> {
+    if own_pane.is_empty() {
+        return None;
+    }
+    let session = rows
+        .iter()
+        .find(|row| row.pane.pane_id == own_pane)
+        .map(|row| row.session_name.as_str())?;
+
+    let in_focus = |row: &&PaneRow| {
+        row.session_name == session && row.window_active && !row.is_sidebar()
+    };
+    rows.iter()
+        .find(|row| in_focus(row) && row.pane.pane_active)
+        .or_else(|| rows.iter().find(|row| in_focus(row) && row.pane_last))
+        .map(|row| row.pane.pane_id.clone())
 }
 
 /// Group flat pane rows into the session → window → pane tree the sidebar draws.
@@ -417,6 +461,8 @@ mod tests {
         assert_eq!(fields.len(), field::COUNT);
         assert_eq!(fields[field::SESSION_NAME], q("session_name"));
         assert_eq!(fields[field::PANE_ID], q("pane_id"));
+        assert_eq!(fields[field::PANE_ACTIVE], q("pane_active"));
+        assert_eq!(fields[field::PANE_LAST], q("pane_last"));
         assert_eq!(fields[field::PANE_PID], q("pane_pid"));
         assert_eq!(fields[field::ROLE], q(PANE_ROLE));
         assert_eq!(fields[field::STATE], q(PANE_STATE));
@@ -592,6 +638,87 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].windows.len(), 1, "@2 had no agent, so it is gone");
         assert_eq!(agents[0].windows[0].panes[0].pane_id, "%1");
+    }
+
+    // ─── where focus is ───────────────────────────────────────────────
+
+    #[test]
+    fn focus_is_the_active_pane_of_our_own_session() {
+        // Our own session is the disambiguator: several can be attached at once, and
+        // only ours says which window and pane this sidebar is beside.
+        let output = [
+            line(&[(field::PANE_ID, "%0"), (field::ROLE, PANE_ROLE_SIDEBAR)]),
+            line(&[(field::PANE_ID, "%1"), (field::PANE_ACTIVE, "0")]),
+            line(&[(field::PANE_ID, "%2"), (field::PANE_ACTIVE, "1")]),
+            // Another session's active pane, which is somebody else's "here".
+            line(&[
+                (field::PANE_ID, "%9"),
+                (field::SESSION_NAME, "ops"),
+                (field::WINDOW_ID, "@9"),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+        ]
+        .join("\n");
+        let rows = parse_pane_rows(&output);
+        assert_eq!(focused_pane(&rows, "%0"), Some("%2".to_owned()));
+    }
+
+    #[test]
+    fn focus_follows_the_sessions_active_window_not_just_our_own() {
+        // So the sidebar you come back to has tracked where you went.
+        let output = [
+            line(&[(field::PANE_ID, "%0"), (field::ROLE, PANE_ROLE_SIDEBAR)]),
+            line(&[(field::PANE_ID, "%1"), (field::WINDOW_ACTIVE, "0")]),
+            line(&[
+                (field::PANE_ID, "%2"),
+                (field::WINDOW_ID, "@2"),
+                (field::WINDOW_ACTIVE, "1"),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+        ]
+        .join("\n");
+        let rows = parse_pane_rows(&output);
+        assert_eq!(focused_pane(&rows, "%0"), Some("%2".to_owned()));
+    }
+
+    #[test]
+    fn a_sidebar_holding_focus_falls_back_to_the_pane_you_came_from() {
+        // Which is what puts the cursor on your last pane the moment you land in the
+        // sidebar, rather than on whatever happens to be first in the list.
+        let output = [
+            line(&[
+                (field::PANE_ID, "%0"),
+                (field::ROLE, PANE_ROLE_SIDEBAR),
+                (field::PANE_ACTIVE, "1"),
+            ]),
+            line(&[(field::PANE_ID, "%1"), (field::PANE_ACTIVE, "0")]),
+            line(&[
+                (field::PANE_ID, "%2"),
+                (field::PANE_ACTIVE, "0"),
+                (field::PANE_LAST, "1"),
+            ]),
+        ]
+        .join("\n");
+        let rows = parse_pane_rows(&output);
+        assert_eq!(focused_pane(&rows, "%0"), Some("%2".to_owned()));
+    }
+
+    #[test]
+    fn focus_is_unknown_when_we_cannot_say_where_it_is() {
+        let rows = parse_pane_rows(&line(&[(field::PANE_ID, "%1")]));
+        // A popup is not a pane in any window, so it has no session to resolve
+        // against — and it is transient anyway.
+        assert_eq!(focused_pane(&rows, ""), None);
+        // Our pane has gone; the next poll will tell us it is time to stop.
+        assert_eq!(focused_pane(&rows, "%404"), None);
+
+        // Nothing but a sidebar in the active window: no jump target to name.
+        let only_sidebar = parse_pane_rows(&line(&[
+            (field::PANE_ID, "%0"),
+            (field::ROLE, PANE_ROLE_SIDEBAR),
+            (field::PANE_ACTIVE, "1"),
+        ]));
+        assert_eq!(focused_pane(&only_sidebar, "%0"), None);
     }
 
     // ─── session order ────────────────────────────────────────────────
