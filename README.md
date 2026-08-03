@@ -100,6 +100,7 @@ moving through the panes of one window is something you can see.
 | `N G` | go to pane N |
 | `C-d` `C-u` | page down / up |
 | `Enter` | jump to the selected pane |
+| click | jump to the pane you clicked; a header or blank row just takes focus |
 | `Tab` | cycle the status filter: all → working → blocked → done |
 | `/` | search; `Enter` keeps the filter, `Esc` clears it |
 | `R` | rename the selected window |

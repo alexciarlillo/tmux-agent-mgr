@@ -31,7 +31,7 @@ do this?" — usually the answer is no.
 ## Commands
 
 ```sh
-cargo test                  # 343 tests, all pure — no tmux server required
+cargo test                  # 357 tests, all pure — no tmux server required
 cargo clippy --all-targets  # must be warning-clean
 cargo build --release
 ./target/release/agent-mgr daemon --once   # resolved per-pane state as TSV
@@ -102,7 +102,9 @@ ui/*           draw dispatch by Surface, row composition, help page, display-wid
                text helpers, theme.
 tmux/*         commands (two error conventions), options (every key as a const),
                query (one `list-panes -a` builds the whole hierarchy, and
-               focused_pane reads which pane tmux focus is on from the same rows).
+               focused_pane reads which pane the *client* is on from the same rows —
+               via client_session, which is why a sidebar follows you out of its
+               own session instead of pointing at where you used to be).
 ```
 
 Non-Rust, and just as load-bearing:
