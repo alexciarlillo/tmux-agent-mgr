@@ -5,7 +5,8 @@
 //! | *(no args)* | the TUI as a persistent sidebar pane |
 //! | `popup` | the same TUI full-screen in a `display-popup`, dismissed on jump |
 //! | `toggle <window-id> [path]` | create or kill the sidebar pane in one window |
-//! | `toggle-all` | same, across every window |
+//! | `toggle-all [window-id]` | same, across every window |
+//! | `focus <window-id> <pane-id> [path]` | select the sidebar, or hop back out of it |
 //! | `resize <window-id>` | re-clamp the sidebar width after a window resize |
 //! | `auto-close <window-id>` | close a window left holding only a sidebar |
 //! | `daemon [--once]` | the status poller; `--once` prints one pass and exits |
@@ -47,7 +48,8 @@ fn main() {
 
     let code = match args.first().map(String::as_str) {
         Some("toggle") => pane::cmd_toggle(&rest),
-        Some("toggle-all") => pane::cmd_toggle_all(),
+        Some("toggle-all") => pane::cmd_toggle_all(&rest),
+        Some("focus") => pane::cmd_focus(&rest),
         Some("resize") => pane::cmd_resize(&rest),
         Some("auto-close") => pane::cmd_auto_close(&rest),
         Some("daemon") => daemon::cmd_daemon(&rest),

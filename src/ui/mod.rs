@@ -306,10 +306,15 @@ fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 /// colour falls back to the muted tone the entire preview used to be drawn in, so
 /// the mirror still reads as a mirror rather than as content you can interact with —
 /// and a pane that emits no colour at all previews exactly as it did before.
+///
+/// The one attribute that is not the capture's is `selected`: the border of the pane
+/// the cursor is on, drawn in the accent colour so it reads as *ours* against a
+/// mirror of somebody else's colours.
 fn preview_style(attrs: crate::preview::Attrs, theme: &theme::Theme) -> Style {
-    let mut style = Style::default().fg(match attrs.fg {
-        Some(colour) => captured_colour(colour),
-        None => theme.muted,
+    let mut style = Style::default().fg(match (attrs.selected, attrs.fg) {
+        (true, _) => theme.accent,
+        (false, Some(colour)) => captured_colour(colour),
+        (false, None) => theme.muted,
     });
     if let Some(colour) = attrs.bg {
         style = style.bg(captured_colour(colour));
@@ -496,6 +501,30 @@ mod tests {
         assert_eq!(list_height(2), 0);
         assert_eq!(list_height(1), 0);
         assert_eq!(list_height(0), 0);
+    }
+
+    // ─── preview styling ──────────────────────────────────────────────
+
+    #[test]
+    fn a_marked_border_is_drawn_in_the_accent_and_everything_else_is_not() {
+        // The selection mark is the one attribute that is ours rather than the
+        // capture's, so it has to win over both the muted fallback and a colour the
+        // pane happened to leave in force.
+        let theme = theme::Theme::default();
+        let marked = crate::preview::Attrs {
+            selected: true,
+            ..Default::default()
+        };
+        assert_eq!(preview_style(marked, &theme).fg, Some(theme.accent));
+
+        let plain = crate::preview::Attrs::default();
+        assert_eq!(preview_style(plain, &theme).fg, Some(theme.muted));
+
+        let coloured = crate::preview::Attrs {
+            fg: Some(crate::preview::Colour::Indexed(2)),
+            ..Default::default()
+        };
+        assert_eq!(preview_style(coloured, &theme).fg, Some(Color::Indexed(2)));
     }
 
     #[test]

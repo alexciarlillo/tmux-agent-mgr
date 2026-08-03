@@ -151,6 +151,12 @@ pub struct App {
     pub rename: Option<RenameState>,
     /// Showing the keymap instead of the list.
     pub help: bool,
+    /// The pane tmux focus was on as of the last snapshot. Held to tell a *change* of
+    /// focus from a snapshot that merely repeats it — snapping the cursor back on
+    /// every poll would make `j`/`k` unusable while you work in another pane.
+    pub focused: Option<String>,
+    /// A focus change not yet applied to the selection, consumed by [`Self::rebuild`].
+    follow: Option<String>,
     /// Latest captured panes for the previewed window, as `(window_id, panes)`.
     pub preview: Option<(String, Vec<PanePreview>)>,
     /// The preview composed for the current geometry. Derived in [`Self::rebuild`]
@@ -184,6 +190,8 @@ impl App {
             search: None,
             rename: None,
             help: false,
+            focused: None,
+            follow: None,
             preview: None,
             preview_lines: Vec::new(),
             spinner: 0,
@@ -241,6 +249,9 @@ impl App {
             .blocks
             .get(self.selected)
             .map(|block| block.target.pane_id.clone());
+        // A focus change asks for a *different* pane, so it takes the anchor's place
+        // and rides the same "find this pane, move the cursor to it" path below.
+        let anchor = self.follow.take().or(anchor);
 
         let mut opts = rows::Options {
             selected: self.selected,
@@ -273,12 +284,37 @@ impl App {
         self.compose_preview();
     }
 
+    /// Take in where tmux focus now is, moving the cursor if it moved.
+    ///
+    /// Only a *change* is acted on. Following focus on every snapshot would fight the
+    /// user: you park the cursor on a pane you are watching, keep working in another,
+    /// and a second later it snaps away. Issues no tmux call of its own, and is called
+    /// from the snapshot drain in [`run`], so the behaviour is testable without a
+    /// worker thread.
+    pub fn apply_focus(&mut self, focused: Option<String>) {
+        // A pass that cannot tell us where focus is (no answer, our pane gone) says
+        // nothing about whether it moved, so it must not clear what we know.
+        let Some(pane_id) = focused else {
+            return;
+        };
+        if self.focused.as_deref() == Some(pane_id.as_str()) {
+            return;
+        }
+        self.focused = Some(pane_id.clone());
+        self.follow = Some(pane_id);
+    }
+
     /// The window the preview should be showing, if this surface has one.
     pub fn preview_window(&self) -> Option<&str> {
         if !self.surface.shows_preview() || self.help {
             return None;
         }
         Some(&self.list.blocks.get(self.selected)?.target.window_id)
+    }
+
+    /// The pane the cursor is on, whose outline the preview marks.
+    pub fn selected_pane(&self) -> Option<&str> {
+        Some(&self.list.blocks.get(self.selected)?.target.pane_id)
     }
 
     /// Re-compose the preview for the current geometry.
@@ -293,9 +329,10 @@ impl App {
             return;
         };
         let wanted = self.preview_window().map(str::to_owned);
+        let selected = self.selected_pane().map(str::to_owned);
         self.preview_lines = match (&self.preview, wanted) {
             (Some((window_id, panes)), Some(wanted)) if *window_id == wanted => {
-                crate::preview::compose(panes, area)
+                crate::preview::compose(panes, area, selected.as_deref())
             }
             _ => Vec::new(),
         };
@@ -569,7 +606,10 @@ pub fn run(
     let size = terminal.size()?;
     let mut app = App::new(surface, tmux_pane, (size.width, size.height));
 
-    let worker = worker::spawn(tmux::global_bool(tmux::CFG_AGENTS_ONLY, false));
+    let worker = worker::spawn(
+        tmux::global_bool(tmux::CFG_AGENTS_ONLY, false),
+        app.own_pane.clone(),
+    );
     // Nothing to show until the first collection lands; ask for it now rather
     // than waiting out an interval.
     worker.request_refresh();
@@ -589,6 +629,8 @@ pub fn run(
             if let Some(preview) = snapshot.preview {
                 app.preview = Some(preview);
             }
+            // After the tree, so the pane it names is one this snapshot listed.
+            app.apply_focus(snapshot.focused);
             received = true;
         }
 
@@ -916,6 +958,85 @@ mod tests {
         assert_eq!(app.scroll, 0);
     }
 
+    // ─── following tmux focus ─────────────────────────────────────────
+
+    fn three_pane_app() -> App {
+        app_with(
+            vec![
+                pane("%1", AgentState::Idle, true),
+                pane("%2", AgentState::Idle, true),
+                pane("%3", AgentState::Idle, true),
+            ],
+            40,
+        )
+    }
+
+    #[test]
+    fn a_focus_change_moves_the_cursor_to_that_pane() {
+        // C-h/C-l/C-j/C-k move tmux focus without touching us; a cursor left behind
+        // means the list and the terminal disagree about "here".
+        let mut app = three_pane_app();
+        app.apply_focus(Some("%3".to_owned()));
+        app.rebuild();
+        assert_eq!(app.list.blocks[app.selected].target.pane_id, "%3");
+    }
+
+    #[test]
+    fn repeated_snapshots_of_the_same_focus_leave_a_hand_moved_cursor_alone() {
+        // You park the cursor on a pane you are watching and keep working elsewhere.
+        // Snapping it back once a second would make the motions unusable.
+        let mut app = three_pane_app();
+        app.apply_focus(Some("%1".to_owned()));
+        app.rebuild();
+
+        app.move_selection(2);
+        app.rebuild();
+        assert_eq!(app.list.blocks[app.selected].target.pane_id, "%3");
+
+        for _ in 0..5 {
+            app.apply_focus(Some("%1".to_owned()));
+            app.rebuild();
+        }
+        assert_eq!(
+            app.list.blocks[app.selected].target.pane_id, "%3",
+            "an unchanged focus must not drag the cursor back"
+        );
+    }
+
+    #[test]
+    fn a_pass_that_cannot_see_focus_does_not_forget_where_it_was() {
+        // Otherwise the next answer would read as a change and yank the cursor.
+        let mut app = three_pane_app();
+        app.apply_focus(Some("%2".to_owned()));
+        app.rebuild();
+        app.move_selection(-1);
+
+        app.apply_focus(None);
+        app.rebuild();
+        assert_eq!(app.list.blocks[app.selected].target.pane_id, "%1");
+        assert_eq!(app.focused.as_deref(), Some("%2"));
+    }
+
+    #[test]
+    fn focus_on_a_pane_the_filter_hides_leaves_the_cursor_where_it_is() {
+        // There is no row to move to, and clamping to a neighbour would claim a
+        // focus that isn't there.
+        let mut app = app_with(
+            vec![
+                pane("%1", AgentState::Working, true),
+                pane("%2", AgentState::Idle, true),
+            ],
+            40,
+        );
+        app.filter = StatusFilter::Working;
+        app.rebuild();
+        assert_eq!(app.list.blocks.len(), 1);
+
+        app.apply_focus(Some("%2".to_owned()));
+        app.rebuild();
+        assert_eq!(app.list.blocks[app.selected].target.pane_id, "%1");
+    }
+
     // ─── the anti-flicker contract ────────────────────────────────────
 
     #[test]
@@ -1129,6 +1250,51 @@ mod tests {
     /// One captured line, as the preview's parser would hand it over.
     fn captured(text: &str) -> Vec<crate::preview::Cell> {
         crate::preview::parse_line(text, &mut crate::preview::Attrs::default())
+    }
+
+    #[test]
+    fn moving_between_panes_of_one_window_still_changes_the_preview() {
+        // The preview target is the *window*, so this motion leaves the capture
+        // untouched — only the selection marker moves. Before it existed, `j` inside
+        // a split window changed nothing on screen at all.
+        let mut second = pane("%2", AgentState::Idle, true);
+        second.pane_index = "1".to_owned();
+        let mut app = surfaced_app(
+            Surface::Popup,
+            vec![pane("%1", AgentState::Idle, true), second],
+            40,
+        );
+        app.size = (200, 50);
+        app.preview = Some((
+            "@1".to_owned(),
+            vec![
+                crate::preview::PanePreview {
+                    pane_id: "%1".to_owned(),
+                    width: 40,
+                    height: 24,
+                    lines: vec![captured("left")],
+                    ..Default::default()
+                },
+                crate::preview::PanePreview {
+                    pane_id: "%2".to_owned(),
+                    left: 40,
+                    width: 40,
+                    height: 24,
+                    lines: vec![captured("right")],
+                    ..Default::default()
+                },
+            ],
+        ));
+        app.rebuild();
+        let before = fingerprint(&app);
+        let text_before: Vec<String> = app.preview_lines.iter().map(|line| line.text()).collect();
+
+        app.move_selection(1);
+        app.rebuild();
+        assert_eq!(app.preview_window(), Some("@1"), "same window either way");
+        assert_ne!(fingerprint(&app), before, "the marker moved, so the frame did");
+        let text_after: Vec<String> = app.preview_lines.iter().map(|line| line.text()).collect();
+        assert_eq!(text_before, text_after, "and only the styling changed");
     }
 
     #[test]

@@ -125,6 +125,9 @@ pub mod conf_only {
     pub const CFG_KEY: &str = "@agent_mgr_key";
     /// Prefix key toggling the sidebar in every window.
     pub const CFG_KEY_ALL: &str = "@agent_mgr_key_all";
+    /// Prefix key selecting the sidebar, or hopping back out of it when you are
+    /// already in it; opens one first if this window has none.
+    pub const CFG_KEY_FOCUS: &str = "@agent_mgr_key_focus";
     /// Prefix-less key opening the full-screen popup; `none` binds nothing.
     pub const CFG_KEY_POPUP: &str = "@agent_mgr_key_popup";
     /// Absolute path to the resolved `agent-mgr` binary, published by
@@ -225,6 +228,7 @@ mod tests {
             conf_only::CFG_NAV,
             conf_only::CFG_KEY,
             conf_only::CFG_KEY_ALL,
+            conf_only::CFG_KEY_FOCUS,
             conf_only::CFG_KEY_POPUP,
             conf_only::HAS_POPUP,
             conf_only::BIN,
@@ -261,6 +265,23 @@ mod tests {
     }
 
     #[test]
+    fn the_conf_binds_every_subcommand_main_dispatches_for_a_key() {
+        // Subcommand names are strings in a tmux binding on one side and match arms
+        // in main.rs on the other, with nothing tying them together. A rename would
+        // leave a key that only fails when pressed.
+        for (command, arity) in [
+            ("toggle \\\"##{window_id}\\\"", "window and path"),
+            ("toggle-all \\\"##{window_id}\\\"", "the initiating window"),
+            ("focus \\\"##{window_id}\\\" \\\"##{pane_id}\\\"", "window and pane"),
+        ] {
+            assert!(
+                SHIPPED_CONF.contains(command),
+                "the conf does not invoke `{command}` with {arity}"
+            );
+        }
+    }
+
+    #[test]
     fn the_conf_binds_the_popup_subcommand_main_actually_dispatches() {
         // `agent-mgr popup` is a string in a tmux binding on one side and a match
         // arm in main.rs on the other; nothing else ties them together.
@@ -281,6 +302,28 @@ mod tests {
         // Rust/tmux boundary, so a rename has to be caught here.
         assert!(SHIPPED_CONF.contains(PANE_TUI_PID));
         assert!(SHIPPED_CONF.contains(WINDOW_ICON));
+    }
+
+    #[test]
+    fn every_focus_hook_is_removed_before_it_is_re_added() {
+        // tmux has no "replace this hook" verb, so a reload of a config that only
+        // appends stacks another copy and signals every sidebar N times per focus
+        // change. The three together are what makes the cursor follow tmux focus:
+        // client-session-changed is the C-j/C-k case neither select hook fires.
+        for hook in [
+            "after-select-pane",
+            "after-select-window",
+            "client-session-changed",
+        ] {
+            assert!(
+                SHIPPED_CONF.contains(&format!("set-hook -ga {hook}")),
+                "{hook} is never set"
+            );
+            assert!(
+                SHIPPED_CONF.contains(&format!("show-hooks -g {hook}")),
+                "{hook} is set but not removed first — a reload would duplicate it"
+            );
+        }
     }
 
     #[test]

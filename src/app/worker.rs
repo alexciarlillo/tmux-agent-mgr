@@ -32,6 +32,10 @@ pub struct Snapshot {
     /// so a snapshot that arrives after the selection moved can be recognised as
     /// stale rather than drawn beside the wrong row.
     pub preview: Option<(String, Vec<PanePreview>)>,
+    /// The pane tmux focus is on, as [`tmux::focused_pane`] resolves it. Read from
+    /// the same `list-panes` the tree comes from, so it costs no extra subprocess and
+    /// cannot disagree with the tree it arrives with.
+    pub focused: Option<String>,
 }
 
 pub struct Worker {
@@ -69,7 +73,10 @@ impl Worker {
 }
 
 /// Start collecting. The thread stops on its own once the receiver is dropped.
-pub fn spawn(agents_only: bool) -> Worker {
+///
+/// `own_pane` is the sidebar's own pane id, used only to resolve which pane tmux
+/// focus is on (see [`tmux::focused_pane`]); empty for a popup.
+pub fn spawn(agents_only: bool, own_pane: String) -> Worker {
     let (tx, rx) = mpsc::channel();
     let wake = Arc::new(AtomicBool::new(false));
     let thread_wake = Arc::clone(&wake);
@@ -81,7 +88,7 @@ pub fn spawn(agents_only: bool) -> Worker {
         loop {
             // A tmux failure here means the server is gone, and so is our pane;
             // there is nothing to report and nothing to retry.
-            let Some(sessions) = collect(agents_only, &mut git) else {
+            let Some((sessions, focused)) = collect(agents_only, &own_pane, &mut git) else {
                 return;
             };
             // Read the target fresh each pass: the UI may have moved since the last
@@ -96,7 +103,14 @@ pub fn spawn(agents_only: bool) -> Worker {
                 let panes = preview::capture_window(&window_id);
                 (window_id, panes)
             });
-            if tx.send(Snapshot { sessions, preview }).is_err() {
+            if tx
+                .send(Snapshot {
+                    sessions,
+                    preview,
+                    focused,
+                })
+                .is_err()
+            {
                 return;
             }
             wait(&thread_wake, INTERVAL);
@@ -124,8 +138,16 @@ fn wait(wake: &AtomicBool, total: Duration) {
 }
 
 /// One collection pass: read every pane, attach git context, group.
-fn collect(agents_only: bool, git: &mut GitCache) -> Option<Vec<SessionGroup>> {
+///
+/// Returns the tree and the focused pane together — both come out of the same
+/// `list-panes`, so they always describe one instant.
+fn collect(
+    agents_only: bool,
+    own_pane: &str,
+    git: &mut GitCache,
+) -> Option<(Vec<SessionGroup>, Option<String>)> {
     let rows = tmux::list_panes().ok()?;
+    let focused = tmux::focused_pane(&rows, own_pane);
     let mut sessions = tmux::group_sessions(&rows, agents_only);
     // One extra subprocess per pass to honour the user's session order. tmux itself
     // has no session ordering, so without this the list is alphabetical whatever the
@@ -151,7 +173,7 @@ fn collect(agents_only: bool, git: &mut GitCache) -> Option<Vec<SessionGroup>> {
     }
     git.retain_paths(&live_paths);
 
-    Some(sessions)
+    Some((sessions, focused))
 }
 
 #[cfg(test)]

@@ -38,16 +38,49 @@ pub fn cmd_toggle(args: &[&str]) -> i32 {
         return 0;
     }
 
-    create_sidebar(window_id, pane_path);
+    create_sidebar(window_id, pane_path, Focus::Sidebar);
     0
 }
 
-/// `agent-mgr toggle-all` — one keystroke for the whole server.
+/// `agent-mgr focus <window-id> <current-pane-id> [path]` — get into the sidebar,
+/// or back out of it.
+///
+/// One key for the round trip: from a work pane it selects the sidebar, from inside
+/// the sidebar it returns you to the pane you came from, and in a window that has no
+/// sidebar it opens one and puts you in it. Anything else would make the key's effect
+/// depend on state you cannot see from the keyboard.
+pub fn cmd_focus(args: &[&str]) -> i32 {
+    let Some(window_id) = args.first().copied() else {
+        return 0;
+    };
+    let current = args.get(1).copied().unwrap_or_default();
+    let pane_path = args.get(2).copied().unwrap_or("~");
+
+    match focus_action(find_sidebar_pane(window_id).as_deref(), current) {
+        // `-l` is the window's own last-pane memory, which is exactly "where I was
+        // before I came in here" — no state of our own to keep in sync.
+        FocusAction::HopBack => {
+            tmux::run_tmux_quiet(&["select-pane", "-t", window_id, "-l"]);
+        }
+        FocusAction::Select(sidebar) => {
+            tmux::run_tmux_quiet(&["select-pane", "-t", &sidebar]);
+        }
+        FocusAction::Create => create_sidebar(window_id, pane_path, Focus::Sidebar),
+    }
+    0
+}
+
+/// `agent-mgr toggle-all [window-id]` — one keystroke for the whole server.
 ///
 /// If a sidebar exists anywhere, this turns them all off; otherwise it turns
 /// them all on. Treating "any" as "on" means the key always does the thing you
 /// expect after you have toggled one window individually.
-pub fn cmd_toggle_all() -> i32 {
+///
+/// `window-id` is the window the key was pressed in, and the only one whose new
+/// sidebar takes focus: opening a sidebar in twelve background windows should not
+/// silently move where you land in each of them.
+pub fn cmd_toggle_all(args: &[&str]) -> i32 {
+    let initiator = args.first().copied().unwrap_or_default();
     let listing = tmux::run_tmux(&["list-panes", "-a", "-F", &pane_role_format()]).unwrap_or_default();
 
     if let Some(panes) = sidebar_panes(&listing) {
@@ -66,9 +99,38 @@ pub fn cmd_toggle_all() -> i32 {
     .unwrap_or_default();
 
     for (window_id, path) in unique_window_paths(&windows) {
-        create_sidebar(&window_id, &path);
+        let focus = if window_id == initiator {
+            Focus::Sidebar
+        } else {
+            Focus::Unchanged
+        };
+        create_sidebar(&window_id, &path, focus);
     }
     0
+}
+
+/// What `focus` should do, decided before anything is touched.
+///
+/// Split from the I/O for the same reason `should_kill_window` is: the tests must not
+/// move the developer's own tmux client around.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FocusAction {
+    /// We are in the sidebar already — go back where we came from.
+    HopBack,
+    /// Select the sidebar pane that already exists.
+    Select(String),
+    /// No sidebar in this window; open one.
+    Create,
+}
+
+fn focus_action(sidebar: Option<&str>, current: &str) -> FocusAction {
+    match sidebar {
+        // An empty `current` cannot match a real pane id, so a binding that failed to
+        // pass one still focuses rather than hopping somewhere unasked.
+        Some(sidebar) if !current.is_empty() && sidebar == current => FocusAction::HopBack,
+        Some(sidebar) => FocusAction::Select(sidebar.to_owned()),
+        None => FocusAction::Create,
+    }
 }
 
 /// `agent-mgr resize <window-id>` — re-clamp an existing sidebar after the
@@ -118,8 +180,17 @@ fn numeric_format(target: &str, format: &str) -> Option<u32> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-/// Split a full-height sidebar pane into `window_id` and hand focus back.
-fn create_sidebar(window_id: &str, pane_path: &str) {
+/// Where focus should be once the sidebar exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Focus {
+    /// Land in the new sidebar — you opened it to use it.
+    Sidebar,
+    /// Leave focus exactly where it was, for a window you did not ask to be moved in.
+    Unchanged,
+}
+
+/// Split a full-height sidebar pane into `window_id`.
+fn create_sidebar(window_id: &str, pane_path: &str, focus: Focus) {
     let width = configured_width(window_id).to_string();
     let position = Position::from_setting(&tmux::display_message(
         window_id,
@@ -136,9 +207,14 @@ fn create_sidebar(window_id: &str, pane_path: &str) {
     .unwrap_or_default();
     let target = outermost_pane(&geometry, position).unwrap_or_else(|| window_id.to_owned());
 
-    // Remember where focus was: splitting moves it into the new pane, and the
-    // sidebar is something you glance at, not something you land in.
-    let previously_active = tmux::display_message(window_id, "#{pane_id}");
+    // `split-window` leaves focus in the new pane, which is what we want when you
+    // opened the sidebar yourself. Only the windows you did *not* aim at need their
+    // previous pane remembered — and asking tmux for it costs a subprocess, so only
+    // those pay for it.
+    let previously_active = match focus {
+        Focus::Sidebar => String::new(),
+        Focus::Unchanged => tmux::display_message(window_id, "#{pane_id}"),
+    };
 
     let exe = std::env::current_exe()
         .ok()
@@ -168,10 +244,14 @@ fn create_sidebar(window_id: &str, pane_path: &str) {
         tmux::set_pane_option_raw(&sidebar, tmux::PANE_ROLE, tmux::PANE_ROLE_SIDEBAR);
     }
 
-    if previously_active.is_empty() {
-        tmux::run_tmux_quiet(&["select-pane", "-t", window_id, "-l"]);
-    } else {
-        tmux::run_tmux_quiet(&["select-pane", "-t", &previously_active]);
+    if focus == Focus::Unchanged {
+        if previously_active.is_empty() {
+            // tmux could not tell us which pane it was; its own last-pane memory is
+            // the next best answer.
+            tmux::run_tmux_quiet(&["select-pane", "-t", window_id, "-l"]);
+        } else {
+            tmux::run_tmux_quiet(&["select-pane", "-t", &previously_active]);
+        }
     }
 }
 
@@ -452,6 +532,29 @@ mod tests {
     fn an_unprovable_session_shape_never_kills() {
         assert!(!should_kill_window(Some("sidebar"), None, Some(1)));
         assert!(!should_kill_window(Some("sidebar"), Some(0), Some(1)));
+    }
+
+    // ─── the focus key ────────────────────────────────────────────────
+
+    #[test]
+    fn the_focus_key_goes_in_from_a_work_pane_and_back_out_from_the_sidebar() {
+        // One key for the round trip: an effect that depended on state you cannot see
+        // from the keyboard would be worse than two keys.
+        assert_eq!(focus_action(Some("%2"), "%1"), FocusAction::Select("%2".to_owned()));
+        assert_eq!(focus_action(Some("%2"), "%2"), FocusAction::HopBack);
+    }
+
+    #[test]
+    fn the_focus_key_opens_a_sidebar_in_a_window_that_has_none() {
+        assert_eq!(focus_action(None, "%1"), FocusAction::Create);
+        assert_eq!(focus_action(None, ""), FocusAction::Create);
+    }
+
+    #[test]
+    fn a_binding_that_passed_no_current_pane_still_focuses_rather_than_hopping() {
+        // An empty id must not match the sidebar's, or the key would send you
+        // somewhere you did not ask for.
+        assert_eq!(focus_action(Some("%2"), ""), FocusAction::Select("%2".to_owned()));
     }
 
     // ─── placement ────────────────────────────────────────────────────

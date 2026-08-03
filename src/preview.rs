@@ -75,6 +75,14 @@ pub struct Attrs {
     /// draw the highlighted row of a selection menu, which is often the one thing
     /// you are looking at the preview to see.
     pub reverse: bool,
+    /// Chrome of ours, not anything the capture said: set on the border of the pane
+    /// the list has selected, and resolved to the accent colour by
+    /// [`crate::ui::preview_style`]. Kept as an intent rather than a colour so the
+    /// theme stays on the rendering side, exactly as the muted fallback does.
+    ///
+    /// [`apply_sgr`] never touches it, so no escape sequence can claim to be the
+    /// selection.
+    pub selected: bool,
 }
 
 /// One character of captured content and the attributes it carried.
@@ -238,10 +246,16 @@ fn scale(value: usize, source: usize, target: usize) -> usize {
 /// Compose the panes into exactly `area.height` lines of exactly `area.width`
 /// columns.
 ///
+/// `selected` is the pane id the list's cursor is on; its border is marked for the
+/// accent colour so moving between panes *of one window* changes something on
+/// screen. Without it the mirror only ever marked tmux's active pane, and `j`/`k`
+/// inside a split window looked like a key that did nothing.
+///
 /// A single pane skips the layout entirely and is simply cropped: there is no shape
 /// to convey, and a border around the whole preview would only cost two rows of the
-/// content you actually wanted to read.
-pub fn compose(panes: &[PanePreview], area: Rect) -> Vec<Line> {
+/// content you actually wanted to read — and nothing to disambiguate either, since
+/// the whole preview is that one pane.
+pub fn compose(panes: &[PanePreview], area: Rect, selected: Option<&str>) -> Vec<Line> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
@@ -251,8 +265,17 @@ pub fn compose(panes: &[PanePreview], area: Rect) -> Vec<Line> {
         [] => {}
         [only] => fill(&mut grid, area, &only.lines),
         panes => {
-            for (pane, rect) in panes.iter().zip(rects(panes, area)) {
-                draw(&mut grid, rect, pane);
+            let rects = rects(panes, area);
+            let is_selected =
+                |pane: &PanePreview| selected.is_some_and(|id| id == pane.pane_id);
+            // The selected pane goes last so its accent border survives: `rects`
+            // documents that at extreme scale factors two rects can overlap, and the
+            // pane drawn later wins those cells.
+            for (pane, rect) in panes.iter().zip(&rects).filter(|(pane, _)| !is_selected(pane)) {
+                draw(&mut grid, *rect, pane, false);
+            }
+            for (pane, rect) in panes.iter().zip(&rects).filter(|(pane, _)| is_selected(pane)) {
+                draw(&mut grid, *rect, pane, true);
             }
         }
     }
@@ -264,40 +287,45 @@ pub fn compose(panes: &[PanePreview], area: Rect) -> Vec<Line> {
 /// A rect under 2×2 is skipped rather than drawn as a stray character: at that size
 /// a border is all there is, and a lone `│` in the middle of a preview reads as
 /// corruption.
-fn draw(grid: &mut [Vec<Cell>], rect: Rect, pane: &PanePreview) {
+fn draw(grid: &mut [Vec<Cell>], rect: Rect, pane: &PanePreview, selected: bool) {
     if rect.width < 2 || rect.height < 2 {
         return;
     }
     // The active pane gets a heavier border, which is usually the fastest way to
-    // recognise a familiar layout.
+    // recognise a familiar layout. Selection is carried by colour instead, so the two
+    // can be read independently — and are usually, but not always, the same pane.
     let (horizontal, vertical) = if pane.active {
         ('━', '┃')
     } else {
         ('─', '│')
     };
 
-    // Borders carry default attributes on purpose: they are ours, not the pane's,
-    // and the renderer draws an unstyled cell in the muted preview tone. Inheriting
-    // whatever colour the capture happened to end on would make the frame flicker
-    // between colours as the pane scrolled.
+    // Borders carry no colour *from the capture* on purpose: they are ours, not the
+    // pane's, and the renderer draws an unstyled cell in the muted preview tone.
+    // Inheriting whatever colour the capture happened to end on would make the frame
+    // flicker between colours as the pane scrolled. `selected` is ours to set.
+    let border = Attrs {
+        selected,
+        ..Attrs::default()
+    };
     for column in 0..rect.width {
-        put(grid, rect.x + column, rect.y, horizontal, Attrs::default());
+        put(grid, rect.x + column, rect.y, horizontal, border);
         put(
             grid,
             rect.x + column,
             rect.y + rect.height - 1,
             horizontal,
-            Attrs::default(),
+            border,
         );
     }
     for row in 0..rect.height {
-        put(grid, rect.x, rect.y + row, vertical, Attrs::default());
+        put(grid, rect.x, rect.y + row, vertical, border);
         put(
             grid,
             rect.x + rect.width - 1,
             rect.y + row,
             vertical,
-            Attrs::default(),
+            border,
         );
     }
 
@@ -613,6 +641,11 @@ mod tests {
         parse_line(text, &mut Attrs::default())
     }
 
+    /// Compose with no pane selected, for the tests that are about everything else.
+    fn unselected(panes: &[PanePreview], area: Rect) -> Vec<Line> {
+        compose(panes, area, None)
+    }
+
     fn pane(id: &str, left: u16, top: u16, width: u16, height: u16, text: &[&str]) -> PanePreview {
         PanePreview {
             pane_id: id.to_owned(),
@@ -658,7 +691,7 @@ mod tests {
             pane("%2", 41, 0, 40, 20, &["right"]),
         ];
         for (width, height) in [(20, 6), (40, 12), (80, 24), (3, 3)] {
-            let composed = compose(&panes, area(width, height));
+            let composed = unselected(&panes, area(width, height));
             assert_eq!(composed.len(), height, "line count at {width}x{height}");
             for line in &composed {
                 assert_eq!(
@@ -688,7 +721,7 @@ mod tests {
             ),
             pane("%2", 40, 0, 40, 20, &["plain"]),
         ];
-        let composed = compose(&panes, area(40, 6));
+        let composed = unselected(&panes, area(40, 6));
         for line in &composed {
             assert_eq!(line.width(), 40, "{:?}", line.text());
         }
@@ -708,7 +741,7 @@ mod tests {
             pane("%1", 0, 0, 40, 20, &["a\u{300}b\u{301}c"]),
             pane("%2", 40, 0, 40, 20, &["x"]),
         ];
-        for line in compose(&panes, area(40, 6)) {
+        for line in unselected(&panes, area(40, 6)) {
             assert_eq!(line.width(), 40, "{:?}", line.text());
         }
     }
@@ -722,7 +755,7 @@ mod tests {
         ];
         // 5 wide total leaves 3 inner columns: "ab" fits, the emoji needs 2 and only
         // 1 remains.
-        let composed = compose(&panes, area(10, 5));
+        let composed = unselected(&panes, area(10, 5));
         for line in &composed {
             assert_eq!(line.width(), 10, "{:?}", line.text());
         }
@@ -732,7 +765,7 @@ mod tests {
     fn a_single_pane_is_cropped_without_a_border() {
         // Nothing to convey about shape, and a border would cost two rows of the
         // content you opened the preview to read.
-        let composed = compose(&[pane("%1", 0, 0, 80, 24, &["hello", "world"])], area(10, 4));
+        let composed = unselected(&[pane("%1", 0, 0, 80, 24, &["hello", "world"])], area(10, 4));
         assert_eq!(composed[0].text(), "hello     ");
         assert_eq!(composed[1].text(), "world     ");
         assert_eq!(composed[2].text(), "          ", "short capture pads out");
@@ -741,7 +774,7 @@ mod tests {
 
     #[test]
     fn an_overlong_capture_line_cannot_widen_the_output() {
-        let composed = compose(
+        let composed = unselected(
             &[pane("%1", 0, 0, 80, 24, &["x".repeat(500).as_str()])],
             area(12, 2),
         );
@@ -751,13 +784,13 @@ mod tests {
     #[test]
     fn a_zero_sized_area_produces_nothing() {
         let panes = [pane("%1", 0, 0, 80, 24, &["hi"])];
-        assert!(compose(&panes, area(0, 5)).is_empty());
-        assert!(compose(&panes, area(5, 0)).is_empty());
+        assert!(unselected(&panes, area(0, 5)).is_empty());
+        assert!(unselected(&panes, area(5, 0)).is_empty());
     }
 
     #[test]
     fn no_panes_composes_to_blank_rows_rather_than_panicking() {
-        let composed = compose(&[], area(6, 2));
+        let composed = unselected(&[], area(6, 2));
         assert_eq!(composed.len(), 2);
         for line in &composed {
             assert_eq!(line.text(), "      ");
@@ -832,7 +865,7 @@ mod tests {
             pane("%1", 0, 0, 40, 20, &["L".repeat(100).as_str()]),
             pane("%2", 40, 0, 40, 20, &["R".repeat(100).as_str()]),
         ];
-        let composed = compose(&panes, area(40, 8));
+        let composed = unselected(&panes, area(40, 8));
         let row = composed[1].text();
         // By chars, not bytes — the box-drawing characters are 3 bytes each.
         let left: String = row.chars().take(20).collect();
@@ -848,7 +881,7 @@ mod tests {
             pane("%2", 40, 0, 40, 20, &[]),
         ];
         panes[1].active = true;
-        let composed: String = compose(&panes, area(40, 8))
+        let composed: String = unselected(&panes, area(40, 8))
             .iter()
             .map(Line::text)
             .collect::<Vec<_>>()
@@ -861,9 +894,119 @@ mod tests {
     fn a_rect_too_small_to_border_is_skipped_rather_than_half_drawn() {
         // A lone stray border character reads as corruption.
         let panes = vec![pane("%1", 0, 0, 10, 10, &[]), pane("%2", 10, 0, 10, 10, &[])];
-        let composed = compose(&panes, area(3, 1));
+        let composed = unselected(&panes, area(3, 1));
         assert_eq!(composed.len(), 1);
         assert_eq!(composed[0].text(), "   ");
+    }
+
+    // ─── the selection marker ─────────────────────────────────────────
+
+    /// Two panes side by side, with `text` in each.
+    fn split(text: &str) -> Vec<PanePreview> {
+        vec![
+            pane("%1", 0, 0, 40, 20, &[text]),
+            pane("%2", 40, 0, 40, 20, &[text]),
+        ]
+    }
+
+    /// Which columns of a composed line are marked as the selection.
+    fn marked_columns(line: &Line) -> Vec<usize> {
+        let mut marked = Vec::new();
+        let mut column = 0;
+        for span in &line.spans {
+            let span_width = display_width(&span.text);
+            if span.attrs.selected {
+                marked.extend(column..column + span_width);
+            }
+            column += span_width;
+        }
+        marked
+    }
+
+    #[test]
+    fn only_the_selected_panes_border_is_marked_for_the_accent() {
+        // Without this, moving between panes *of one window* changed nothing on
+        // screen and `j`/`k` looked like keys that did nothing.
+        let composed = compose(&split("hi"), area(40, 8), Some("%2"));
+        let border_row = &composed[0];
+        let marked = marked_columns(border_row);
+        assert!(!marked.is_empty(), "nothing was marked");
+        assert!(
+            marked.iter().all(|column| *column >= 20),
+            "the left pane's border was marked too: {marked:?}"
+        );
+
+        // Content keeps the capture's own attributes; only chrome is ours to mark.
+        for line in &composed {
+            for span in &line.spans {
+                assert!(
+                    !span.attrs.selected || span.text.chars().all(is_border),
+                    "a content span was marked: {:?}",
+                    span.text
+                );
+            }
+        }
+    }
+
+    fn is_border(ch: char) -> bool {
+        matches!(ch, '─' | '│' | '━' | '┃')
+    }
+
+    #[test]
+    fn selection_and_the_active_pane_are_read_independently() {
+        // They are usually the same pane and sometimes not; colour says "the cursor
+        // is here", the heavy glyph says "tmux is here".
+        let mut panes = split("");
+        panes[0].active = true;
+        let composed = compose(&panes, area(40, 8), Some("%2"));
+        let row = &composed[1];
+        assert!(row.text().contains('┃'), "the active pane keeps its glyph");
+        assert!(
+            marked_columns(row).iter().all(|column| *column >= 20),
+            "the mark belongs to the selected pane, not the active one"
+        );
+    }
+
+    #[test]
+    fn a_selection_naming_no_visible_pane_marks_nothing() {
+        // The selection can name a pane in another window, or one that just closed.
+        for selected in [None, Some("%99")] {
+            let composed = compose(&split("hi"), area(40, 8), selected);
+            for line in &composed {
+                assert!(
+                    marked_columns(line).is_empty(),
+                    "marked something for {selected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_pane_window_previews_the_same_whether_it_is_selected_or_not() {
+        // There is no border to colour and nothing to disambiguate: the whole
+        // preview is that one pane.
+        let only = [pane("%1", 0, 0, 80, 24, &["hello"])];
+        assert_eq!(
+            compose(&only, area(10, 3), Some("%1")),
+            compose(&only, area(10, 3), None)
+        );
+    }
+
+    #[test]
+    fn the_selected_pane_is_drawn_last_so_an_overlap_cannot_erase_its_border() {
+        // `rects` documents that at extreme scale factors two rects can overlap, and
+        // the pane drawn later owns the shared cells. Selecting the *first* pane is
+        // the case that would otherwise lose its mark.
+        let panes = vec![
+            pane("%1", 0, 0, 200, 20, &[]),
+            pane("%2", 200, 0, 2, 20, &[]),
+        ];
+        let composed = compose(&panes, area(6, 4), Some("%1"));
+        assert!(
+            composed.iter().any(|line| !marked_columns(line).is_empty()),
+            "the selected pane's border was overdrawn: {:?}",
+            composed.iter().map(Line::text).collect::<Vec<_>>()
+        );
     }
 
     // ─── parsing: tabs and control characters ─────────────────────────
@@ -923,7 +1066,7 @@ mod tests {
 
         // And through composition, where it would actually reach the terminal.
         let panes = [pane("%1", 0, 0, 80, 24, &[hostile])];
-        for line in compose(&panes, area(20, 2)) {
+        for line in unselected(&panes, area(20, 2)) {
             assert!(!line.text().contains('\x1b'));
         }
     }
@@ -1032,7 +1175,7 @@ mod tests {
 
     #[test]
     fn colour_survives_into_the_composed_line() {
-        let composed = compose(
+        let composed = unselected(
             &[pane("%1", 0, 0, 80, 24, &["\x1b[32mgo\x1b[0mno"])],
             area(6, 1),
         );
@@ -1045,7 +1188,7 @@ mod tests {
     fn equally_styled_neighbours_collapse_into_one_span() {
         // One span per run rather than per cell: it is what a draw call wants, and
         // it keeps the frame fingerprint in `app` cheap.
-        let composed = compose(
+        let composed = unselected(
             &[pane("%1", 0, 0, 80, 24, &["\x1b[31maaa\x1b[32mbbb"])],
             area(6, 1),
         );
@@ -1062,7 +1205,7 @@ mod tests {
             pane("%1", 0, 0, 40, 20, &["\x1b[41;33mhot"]),
             pane("%2", 40, 0, 40, 20, &["cool"]),
         ];
-        let composed = compose(&panes, area(40, 8));
+        let composed = unselected(&panes, area(40, 8));
         let border = &composed[0];
         assert!(
             border.spans.iter().all(|span| span.attrs == Attrs::default()),
@@ -1077,7 +1220,7 @@ mod tests {
     fn a_wide_glyphs_reserved_column_does_not_split_its_span() {
         // The continuation marker is dropped on collapse, so the glyph keeps the two
         // columns it was allotted and its neighbours stay in one run.
-        let composed = compose(
+        let composed = unselected(
             &[pane("%1", 0, 0, 80, 24, &["\x1b[36ma🌐b"])],
             area(6, 1),
         );
