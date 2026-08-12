@@ -67,6 +67,11 @@ pub const KEYMAP: &[Binding] = &[
         token: "activate_selection",
     },
     Binding {
+        keys: "click",
+        description: "jump to that pane",
+        token: "MouseButton::Left",
+    },
+    Binding {
         keys: "Tab",
         description: "cycle status filter",
         token: "KeyCode::Tab",

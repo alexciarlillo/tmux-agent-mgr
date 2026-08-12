@@ -31,7 +31,7 @@ do this?" — usually the answer is no.
 ## Commands
 
 ```sh
-cargo test                  # 343 tests, all pure — no tmux server required
+cargo test                  # 357 tests, all pure — no tmux server required
 cargo clippy --all-targets  # must be warning-clean
 cargo build --release
 ./target/release/agent-mgr daemon --once   # resolved per-pane state as TSV
@@ -78,9 +78,12 @@ model.rs       AgentKind/State/Status, PermissionMode, the tree types, and the
                option string round-trips. Both status vocabularies merge here.
 detect.rs      passive detection: process name -> agent, title + screen -> state.
                Heuristic and version-sensitive by nature. Ported from the switcher.
+               See "Passive detection per agent" below — the two agents share
+               almost none of this path.
 daemon.rs      one poller per tmux server: precedence, directional debounce, run
                timer, unread marker, diff-only option writes, window tab icons,
-               liveness sweep via ProcessTree, singleton guard.
+               agent identification and liveness via ProcessTree, per-agent
+               capture range (capture_screen), singleton guard.
 hook/mod.rs    `hook <agent> <event>`: stdin JSON, pane state read, apply writes.
 hook/claude.rs the Claude Code mapping. Pure: plan(event, payload, state, now).
 git.rs         branch + worktree for a path, TTL-cached including negative results.
@@ -101,7 +104,9 @@ ui/*           draw dispatch by Surface, row composition, help page, display-wid
                text helpers, theme.
 tmux/*         commands (two error conventions), options (every key as a const),
                query (one `list-panes -a` builds the whole hierarchy, and
-               focused_pane reads which pane tmux focus is on from the same rows).
+               focused_pane reads which pane the *client* is on from the same rows —
+               via client_session, which is why a sidebar follows you out of its
+               own session instead of pointing at where you used to be).
 ```
 
 Non-Rust, and just as load-bearing:
@@ -116,6 +121,44 @@ hook.sh               /bin/sh dispatcher; resolves the binary fresh per fire.
 hooks/hooks.json      Claude Code hook registrations.
 .claude-plugin/       plugin.json + marketplace.json, for `/plugin marketplace add`.
 ```
+
+## Passive detection per agent
+
+The two agents look nothing alike through this lens, and assuming otherwise is how
+Codex detection sat broken. Verified against Claude Code 2.x and Codex 0.144.3.
+
+| | Claude Code | Codex |
+|---|---|---|
+| Foreground command | `claude`, or a bare semver for native installs | `node`, for the npm shim |
+| Sets an OSC title | yes — braille spinner while working | **no, ever** |
+| UI anchor | input box at the bottom | grows down from the top |
+| Working signal | spinner in the title | `esc to interrupt` on screen |
+| Blocked signal | `❯`-cursor numbered menu | `›`-cursor numbered menu |
+
+Three consequences worth keeping straight:
+
+- **Codex is identified from the process tree, not the pane's command.** The npm
+  install runs `node /usr/local/bin/codex`, which spawns the real binary as a
+  child, so tmux reports `node`. `daemon::read_pane` falls back to
+  `ProcessTree::agent_under`, gated by `detect::may_host_agent` so a workspace of
+  plain shells still never pays for a `ps`. Note the `ps -Ao …,comm=,args=` layout:
+  `args` repeats `argv[0]`, so naming the agent needs `agent_from_command_line`,
+  which reads `argv[1]` and requires a `/` in it — otherwise `rg codex` is an agent.
+- **A Codex pane title is never evidence.** Whatever tmux reports came from the
+  launching shell. `state_from_title` used to read any non-empty title as idle,
+  which pinned every Codex pane to idle forever — mid-turn included — because the
+  screen was then never captured at all.
+- **Codex is read from the whole visible screen, Claude from a trailing window**
+  (`daemon::capture_screen`). Codex is top-anchored until its transcript fills the
+  pane, so a fresh session in a 92-row pane puts the status line around row 12,
+  which a bottom-anchored window misses. That needs no staleness bound because the
+  status line is transient — erased the frame a turn ends, never left in the
+  transcript.
+
+To re-derive any of this, don't read the reference repos — their Codex heuristics
+predate the current TUI (they look for an `Action Required` title and
+`press enter to confirm or esc to cancel`; today's wording is `… or esc to go
+back`). Capture a live session instead, per "Live verification" below.
 
 ## The two status sources
 
@@ -281,6 +324,21 @@ Four recipes that have earned their keep:
   `kill-server` and a fresh one in between to stand in for a reboot. Set a decoy
   `@resurrect-hook-post-restore-all` beforehand and check it still ran afterwards —
   that is the assertion that catches clobbering the user's hook.
+- **Re-derive an agent's real screens.** Launch the agent in the probe server with
+  its prompt in argv so it auto-submits, and diff-capture in a loop beside it,
+  saving a file each time `capture-pane -p` *plus* `pane_title` and
+  `pane_current_command` change. One turn yields every transition — a `sleep`-style
+  prompt buys the working frames, and the directory-trust prompt on first launch in
+  a fresh cwd is a free modal. What matters is which parts *don't* vary across the
+  frames: that is the only thing safe to match on.
+- **Exercise a state without running the agent.** Copy `sleep` to
+  `/tmp/fakebin/{node,codex}` and run a pane as
+  `cat captured-screen.txt; /tmp/fakebin/codex 900 & exec /tmp/fakebin/node 900` —
+  a pane whose command is `node`, whose child is `codex`, showing a real captured
+  screen. That drives the whole chain (`may_host_agent` → `ProcessTree` →
+  `capture_screen` → state) with no model call. It cannot test *teardown*, though:
+  `sleep` never reaps, so the killed child lingers as a zombie that `ProcessTree`
+  still counts.
 
 ## Preview specifics
 
@@ -315,3 +373,13 @@ code.
 Known gaps: the `▸ bg` row has no writer (deliberate, above), and the flicker check's
 companion case — that a *working* agent advances the spinner and nothing more — has
 never been run, because it needs a real agent in a pane.
+
+Two things about Codex are still unverified against a live agent. Its **command
+approval** modal has only been inferred: it is the same `list_selection_view`
+widget as the directory-trust prompt and `/model`, both of which were captured and
+do read as Blocked, but this devspace's `/etc/codex/managed_config.toml` pins
+`approval_policy` to `Never`, so the modal itself could not be produced. And
+`ProcessTree` counts a **zombie** agent as live — `ps` still reports
+`[codex] <defunct>` with `comm=codex`. Pre-existing, and harmless in practice
+because the npm shim reaps its child, but it does mean a non-reaping wrapper could
+latch a pane. Excluding zombies means adding `stat=` to the `ps` format.
