@@ -276,7 +276,7 @@ mod tests {
             })
             .collect();
         app.rebuild();
-        (app, crate::app::worker::spawn(false, String::new()))
+        (app, Worker::inert())
     }
 
     fn press(app: &mut App, worker: &Worker, code: KeyCode) {
