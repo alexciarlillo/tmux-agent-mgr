@@ -31,7 +31,7 @@ do this?" — usually the answer is no.
 ## Commands
 
 ```sh
-cargo test                  # 357 tests, all pure — no tmux server required
+cargo test                  # 377 tests, all pure — no tmux server required
 cargo clippy --all-targets  # must be warning-clean
 cargo build --release
 ./target/release/agent-mgr daemon --once   # resolved per-pane state as TSV
@@ -98,7 +98,10 @@ search.rs      the `/` query: terms ANDed across session/window/command/branch/
 preview.rs     popup-only window mirror: capture, ANSI parse, fixed-grid compose.
 app/mod.rs     the event loop, dirty-flag redraw, fingerprint, rebuild, and
                apply_focus — the cursor follows tmux focus, but only on a change.
-app/worker.rs  the only place subprocesses run while the TUI is open.
+               Input and snapshots arrive on one channel (`Msg`), so the loop
+               blocks until something happened rather than polling either.
+app/worker.rs  the only place subprocesses run while the TUI is open. Also reads
+               the SIGUSR1 flag directly, and caches the session order.
 app/input.rs   key handling, including the vim-ish modes.
 ui/*           draw dispatch by Surface, row composition, help page, display-width
                text helpers, theme.
